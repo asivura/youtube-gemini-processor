@@ -143,18 +143,25 @@ DEFAULT_PROMPT = """You are an expert content analyst. Analyze this YouTube vide
 
 ---
 
-## All Visual Content (Comprehensive)
+## All Visual Content with Speaker Notes (Comprehensive)
 
-[List EVERY visual element shown in chronological order]
+[List EVERY visual element shown in chronological order, with detailed speaker notes]
 
-### Slide/Visual 1 - [MM:SS]
+### Slide/Visual 1 - [MM:SS - MM:SS]
 - **Type**: [Slide/Diagram/Chart/Code/Demo/Screenshot]
 - **Title/Header**: [Text shown as title]
 - **Content**: [Describe everything shown]
 - **Full Text**: [Transcribe ALL text visible on this visual]
 - **Data/Numbers**: [Any statistics, percentages, figures]
+- **Speaker Notes**: [Detailed notes of what the speaker says while this visual is shown. Include key explanations, examples, stories, and insights. This should capture the speaker's commentary that accompanies this visual - not just a summary but detailed notes of their points.]
 
 [Continue for ALL visuals]
+
+### Introduction (Before First Slide) - [00:00 - MM:SS]
+- **Speaker Notes**: [What the speaker says before the first slide appears]
+
+### Transitions & Non-Slide Content
+[Capture any important content spoken between slides or when no slides are shown]
 
 ---
 
@@ -217,6 +224,8 @@ DEFAULT_PROMPT = """You are an expert content analyst. Analyze this YouTube vide
 - Include EVERY slide and visual - do not skip any
 - Transcribe ALL text shown on screen
 - Capture the FULL transcript, not a summary
+- Include DETAILED SPEAKER NOTES for each slide - what the speaker explains, examples they give, stories they tell
+- Capture content spoken BEFORE the first slide and BETWEEN slides
 - Be extremely thorough - more detail is better
 - Use proper markdown tables, headers, and formatting"""
 
@@ -228,13 +237,14 @@ CONCISE_PROMPT = """Analyze this YouTube video. Provide:
 3. **Key Topics** with timestamps [MM:SS]
 4. **Main Takeaways** (bullet points)
 5. **Slides & Visual Content** - For EACH slide or visual shown in the video:
-   - Timestamp [MM:SS]
+   - Timestamp [MM:SS - MM:SS] (when slide appears and disappears)
    - Slide title/header (if present)
    - ALL text content on the slide (bullet points, lists, etc.)
    - Any diagrams, charts, or images with descriptions
    - Key data points or statistics shown
+   - **Speaker Notes**: What the speaker says while this slide is shown (key quotes and explanations, not verbatim transcript but detailed notes capturing the main points, examples, and insights shared)
 
-Be concise but comprehensive. Capture ALL slide content verbatim when possible."""
+Be comprehensive. Capture ALL slide content verbatim and detailed speaker commentary for each slide."""
 
 
 TRANSCRIPT_ONLY_PROMPT = """Provide a complete transcript of this YouTube video.

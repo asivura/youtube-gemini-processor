@@ -346,9 +346,13 @@ def process_video(
             model=model,
             contents=[
                 types.Content(
+                    role="user",
                     parts=[
                         types.Part(
-                            file_data=types.FileData(file_uri=normalized_url)
+                            file_data=types.FileData(
+                                file_uri=normalized_url,
+                                mime_type="video/mp4",  # Required for Vertex AI
+                            )
                         ),
                         types.Part(text=prompt),
                     ]

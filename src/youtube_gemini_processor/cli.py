@@ -44,6 +44,18 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class UsageStats:
+    """Token usage and cost statistics."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    input_cost: float = 0.0
+    output_cost: float = 0.0
+    total_cost: float = 0.0
+
+
+@dataclass
 class VideoAnalysis:
     """Structured output from video analysis."""
 
@@ -58,6 +70,7 @@ class VideoAnalysis:
     processed_at: str = ""
     model: str = ""
     error: str | None = None
+    usage: UsageStats | None = None
 
 
 # Default comprehensive analysis prompt - optimized for maximum detail
@@ -214,9 +227,14 @@ CONCISE_PROMPT = """Analyze this YouTube video. Provide:
 2. **Summary** (2-3 paragraphs)
 3. **Key Topics** with timestamps [MM:SS]
 4. **Main Takeaways** (bullet points)
-5. **Notable Visuals** - Describe any important slides, diagrams, or demonstrations shown
+5. **Slides & Visual Content** - For EACH slide or visual shown in the video:
+   - Timestamp [MM:SS]
+   - Slide title/header (if present)
+   - ALL text content on the slide (bullet points, lists, etc.)
+   - Any diagrams, charts, or images with descriptions
+   - Key data points or statistics shown
 
-Be concise but comprehensive."""
+Be concise but comprehensive. Capture ALL slide content verbatim when possible."""
 
 
 TRANSCRIPT_ONLY_PROMPT = """Provide a complete transcript of this YouTube video.
@@ -235,6 +253,34 @@ PROMPTS = {
     "concise": CONCISE_PROMPT,
     "transcript": TRANSCRIPT_ONLY_PROMPT,
 }
+
+# Pricing per 1M tokens (as of Jan 2025)
+# https://ai.google.dev/pricing
+MODEL_PRICING = {
+    "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},  # Per 1M tokens
+    "gemini-3-pro-preview": {"input": 1.25, "output": 10.00},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+}
+
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageStats:
+    """Calculate usage cost based on model and token counts."""
+    pricing = MODEL_PRICING.get(model, MODEL_PRICING["gemini-3-flash-preview"])
+
+    # Convert to cost (pricing is per 1M tokens)
+    input_cost = (input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+
+    return UsageStats(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        input_cost=input_cost,
+        output_cost=output_cost,
+        total_cost=input_cost + output_cost,
+    )
 
 
 def get_gemini_client(
@@ -328,7 +374,7 @@ def process_video(
     client,
     url: str,
     prompt: str,
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3-flash-preview",
 ) -> VideoAnalysis:
     """Process a single YouTube video with Gemini API."""
     from google.genai import types
@@ -362,6 +408,13 @@ def process_video(
 
         analysis.raw_response = response.text
 
+        # Extract usage stats from response
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            usage = response.usage_metadata
+            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
+
         # Try to extract title from response
         title_match = re.search(
             r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
@@ -391,11 +444,19 @@ def format_output_markdown(analysis: VideoAnalysis) -> str:
     if analysis.error:
         return f"# Error Processing Video\n\n**URL**: {analysis.url}\n\n**Error**: {analysis.error}\n"
 
+    usage_section = ""
+    if analysis.usage:
+        u = analysis.usage
+        usage_section = f"""
+**Usage**: {u.input_tokens:,} input + {u.output_tokens:,} output = {u.total_tokens:,} tokens
+**Cost**: ${u.total_cost:.6f} (${u.input_cost:.6f} input + ${u.output_cost:.6f} output)
+"""
+
     output = f"""# Video Analysis
 
 **URL**: {analysis.url}
 **Processed**: {analysis.processed_at}
-**Model**: {analysis.model}
+**Model**: {analysis.model}{usage_section}
 
 ---
 
@@ -406,6 +467,17 @@ def format_output_markdown(analysis: VideoAnalysis) -> str:
 
 def format_output_json(analysis: VideoAnalysis) -> str:
     """Format analysis as JSON."""
+    usage_dict = None
+    if analysis.usage:
+        u = analysis.usage
+        usage_dict = {
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "total_tokens": u.total_tokens,
+            "input_cost_usd": u.input_cost,
+            "output_cost_usd": u.output_cost,
+            "total_cost_usd": u.total_cost,
+        }
     return json.dumps(
         {
             "url": analysis.url,
@@ -414,6 +486,7 @@ def format_output_json(analysis: VideoAnalysis) -> str:
             "model": analysis.model,
             "content": analysis.raw_response,
             "summary": analysis.summary,
+            "usage": usage_dict,
             "error": analysis.error,
         },
         indent=2,
@@ -466,14 +539,14 @@ def get_safe_filename(url: str) -> str:
 @click.option(
     "--model",
     type=click.Choice([
-        "gemini-3-flash",
-        "gemini-3-pro",
+        "gemini-3-flash-preview",
+        "gemini-3-pro-preview",
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-2.0-flash",
     ]),
-    default="gemini-2.5-flash",
-    help="Gemini model to use (default: gemini-2.5-flash)",
+    default="gemini-3-flash-preview",
+    help="Gemini model to use (default: gemini-3-flash-preview)",
 )
 @click.option(
     "--api-key",

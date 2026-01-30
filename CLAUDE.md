@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-YouTube Gemini Processor is a CLI tool for processing YouTube videos using Google's Gemini API. It extracts transcripts, visual descriptions, and detailed analysis in multiple formats.
+Video Processor CLI for processing videos using Google's Gemini API. Supports YouTube URLs and local video files. Extracts transcripts, visual descriptions, and detailed analysis in multiple formats.
 
 ## Commands
 
@@ -12,8 +12,12 @@ YouTube Gemini Processor is a CLI tool for processing YouTube videos using Googl
 # Install dependencies
 uv pip install -e .
 
-# Run the tool
-yt-process <youtube-url>
+# Run the tool (YouTube URL or local file)
+yt-process <youtube-url-or-file>
+
+# Examples
+yt-process "https://www.youtube.com/watch?v=VIDEO_ID"
+yt-process ./video.mp4
 
 # Lint
 uv run ruff check src/
@@ -22,7 +26,7 @@ uv run ruff check src/
 uv run ruff format src/
 
 # Run with verbose output
-yt-process -v <youtube-url>
+yt-process -v ./video.mp4
 ```
 
 ## Architecture
@@ -34,10 +38,19 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 | `UsageStats` | Dataclass for token usage and cost tracking |
 | `VideoAnalysis` | Dataclass for structured analysis output |
 | `get_gemini_client()` | Initialize Gemini API client (API key or Vertex AI) |
+| `is_local_file()` | Detect if input is a local file path |
 | `validate_youtube_url()` | Parse and normalize YouTube URL formats |
-| `process_video()` | Main processing function using Gemini API |
+| `process_video()` | Process YouTube videos via URL |
+| `process_local_file()` | Process local files via Files API upload |
 | `calculate_cost()` | Token usage cost calculation with model pricing |
 | `format_output_*()` | Output formatters (markdown, json) |
+
+## Input Types
+
+- **YouTube URLs** - Passed directly to Gemini via `file_uri`
+- **Local files** - Uploaded via Gemini Files API, then processed
+
+Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
 
 ## Analysis Modes
 

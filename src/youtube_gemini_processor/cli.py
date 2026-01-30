@@ -418,6 +418,11 @@ def is_youtube_url(url: str) -> bool:
     return any(re.search(pattern, url) for pattern in youtube_patterns)
 
 
+def is_gcs_uri(uri: str) -> bool:
+    """Check if input is a Google Cloud Storage URI."""
+    return uri.startswith("gs://")
+
+
 def get_video_mime_type(file_path: Path) -> str:
     """Get MIME type for a video file based on extension."""
     ext = file_path.suffix.lower()
@@ -511,6 +516,86 @@ def process_local_file(
             analysis.title = title_match.group(1).strip()
         else:
             analysis.title = path.stem  # Use filename as fallback
+
+        # Extract summary if present
+        summary_match = re.search(
+            r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
+            response.text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if summary_match:
+            analysis.summary = summary_match.group(1).strip()
+
+    except Exception as e:
+        analysis.error = str(e)
+
+    return analysis
+
+
+def process_gcs_uri(
+    client,
+    gcs_uri: str,
+    prompt: str,
+    model: str = "gemini-3-flash-preview",
+    verbose: bool = False,
+) -> VideoAnalysis:
+    """Process a video from Google Cloud Storage with Gemini API."""
+    from google.genai import types
+
+    # Extract filename from GCS URI for display
+    filename = gcs_uri.split("/")[-1]
+
+    # Determine MIME type from extension
+    ext = Path(filename).suffix.lower()
+    mime_type = VIDEO_MIME_TYPES.get(ext, "video/mp4")
+
+    analysis = VideoAnalysis(
+        url=gcs_uri,
+        processed_at=datetime.now().isoformat(),
+        model=model,
+    )
+
+    try:
+        if verbose:
+            click.echo(f"  Processing GCS file: {filename}", err=True)
+
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            file_data=types.FileData(
+                                file_uri=gcs_uri,
+                                mime_type=mime_type,
+                            )
+                        ),
+                        types.Part(text=prompt),
+                    ],
+                )
+            ],
+        )
+
+        analysis.raw_response = response.text
+
+        # Extract usage stats from response
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            usage = response.usage_metadata
+            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
+
+        # Try to extract title from response
+        title_match = re.search(
+            r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
+            response.text,
+            re.IGNORECASE,
+        )
+        if title_match:
+            analysis.title = title_match.group(1).strip()
+        else:
+            analysis.title = Path(filename).stem  # Use filename as fallback
 
         # Extract summary if present
         summary_match = re.search(
@@ -651,11 +736,16 @@ def format_output_json(analysis: VideoAnalysis) -> str:
 
 
 def get_safe_filename(input_source: str) -> str:
-    """Generate safe filename from input source (URL or file path)."""
+    """Generate safe filename from input source (URL, file path, or GCS URI)."""
     # Check if it's a local file
     path = Path(input_source)
     if path.exists() and path.is_file():
         return path.stem  # Return filename without extension
+
+    # Check if it's a GCS URI
+    if input_source.startswith("gs://"):
+        filename = input_source.split("/")[-1]
+        return Path(filename).stem
 
     # Check if it's a YouTube URL
     video_id = extract_video_id(input_source)
@@ -881,6 +971,10 @@ def main(
             # Detect input type and process accordingly
             if is_local_file(video_input):
                 analysis = process_local_file(
+                    client, video_input, analysis_prompt, model, verbose
+                )
+            elif is_gcs_uri(video_input):
+                analysis = process_gcs_uri(
                     client, video_input, analysis_prompt, model, verbose
                 )
             else:

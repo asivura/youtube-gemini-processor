@@ -277,6 +277,20 @@ MODEL_PRICING = {
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
 }
 
+# Maximum output tokens per model
+MODEL_MAX_OUTPUT_TOKENS = {
+    "gemini-3-flash-preview": 65536,
+    "gemini-3-pro-preview": 65536,
+    "gemini-2.5-flash": 65536,
+    "gemini-2.5-pro": 65536,
+    "gemini-2.0-flash": 8192,
+}
+
+
+def get_max_output_tokens(model: str) -> int:
+    """Get maximum output tokens for a model."""
+    return MODEL_MAX_OUTPUT_TOKENS.get(model, 8192)
+
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageStats:
     """Calculate usage cost based on model and token counts."""
@@ -495,6 +509,9 @@ def process_local_file(
                     ],
                 )
             ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=get_max_output_tokens(model),
+            ),
         )
 
         analysis.raw_response = response.text
@@ -575,6 +592,9 @@ def process_gcs_uri(
                     ],
                 )
             ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=get_max_output_tokens(model),
+            ),
         )
 
         analysis.raw_response = response.text
@@ -646,6 +666,9 @@ def process_video(
                     ],
                 )
             ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=get_max_output_tokens(model),
+            ),
         )
 
         analysis.raw_response = response.text

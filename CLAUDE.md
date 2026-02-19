@@ -39,9 +39,11 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 | `VideoAnalysis` | Dataclass for structured analysis output |
 | `get_gemini_client()` | Initialize Gemini API client (API key or Vertex AI) |
 | `is_local_file()` | Detect if input is a local file path |
+| `is_files_api_ref()` | Detect if input is a Files API reference |
 | `validate_youtube_url()` | Parse and normalize YouTube URL formats |
 | `process_video()` | Process YouTube videos via URL |
 | `process_local_file()` | Process local files via Files API upload |
+| `process_files_api_ref()` | Process using existing Files API reference (no upload) |
 | `calculate_cost()` | Token usage cost calculation with model pricing |
 | `format_output_*()` | Output formatters (markdown, json) |
 
@@ -49,9 +51,30 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 
 - **YouTube URLs** - Passed directly to Gemini via `file_uri`
 - **Local files** - Uploaded via Gemini Files API, then processed (API key only, not Vertex AI)
+- **Files API references** - `files/abc123` references to previously uploaded files (reuse for 48h)
 - **GCS URIs** - `gs://` paths processed directly via Vertex AI
 
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
+
+### Files API Reuse
+
+Upload a video once and reuse the reference for multiple analyses (expires after 48 hours):
+
+```bash
+# Upload only — prints the file reference
+yt-process ./video.mp4 --upload-only
+
+# Reuse the reference (no re-upload, no re-processing)
+yt-process files/abc123 -m comprehensive
+yt-process files/abc123 -m segments
+yt-process files/abc123 -m transcript
+
+# List uploaded files
+yt-process --list-files
+
+# Delete a file
+yt-process --delete-file files/abc123
+```
 
 ### GCS Processing (Vertex AI)
 

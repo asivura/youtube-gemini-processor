@@ -363,7 +363,7 @@ SEGMENTS_SCHEMA = {
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageStats:
     """Calculate usage cost based on model and token counts."""
-    pricing = MODEL_PRICING.get(model, MODEL_PRICING["gemini-3-flash-preview"])
+    pricing = MODEL_PRICING.get(model, MODEL_PRICING["gemini-3-pro-preview"])
 
     # Convert to cost (pricing is per 1M tokens)
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
@@ -555,7 +555,7 @@ def process_local_file(
     client,
     file_path: str,
     prompt: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-3-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
 ) -> VideoAnalysis:
@@ -662,7 +662,7 @@ def process_gcs_uri(
     client,
     gcs_uri: str,
     prompt: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-3-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
 ) -> VideoAnalysis:
@@ -752,7 +752,7 @@ def process_video(
     client,
     url: str,
     prompt: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-3-pro-preview",
     response_schema: dict | None = None,
 ) -> VideoAnalysis:
     """Process a single YouTube video with Gemini API."""
@@ -1147,8 +1147,8 @@ def get_safe_filename(input_source: str) -> str:
             "gemini-2.0-flash",
         ]
     ),
-    default="gemini-3-flash-preview",
-    help="Gemini model to use (default: gemini-3-flash-preview)",
+    default="gemini-3-pro-preview",
+    help="Gemini model to use (default: gemini-3-pro-preview)",
 )
 @click.option(
     "--api-key",

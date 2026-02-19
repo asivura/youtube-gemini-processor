@@ -53,18 +53,15 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
 
-### GCS Bucket for Video Processing
+### GCS Processing (Vertex AI)
 
 For Vertex AI processing (when `GOOGLE_GENAI_USE_VERTEXAI=true`), local files must be uploaded to GCS first since the Files API is not supported with Vertex AI.
 
-- **Bucket**: `gs://asivura-video-processing/`
-- **Project**: `pandb-content-poc`
-
 ```bash
-# Upload and process
-gcloud storage cp "./video.mp4" gs://asivura-video-processing/
-uv run yt-process "gs://asivura-video-processing/video.mp4" \
-  -v --vertex --project pandb-content-poc
+# Upload and process via Vertex AI
+gcloud storage cp "./video.mp4" gs://your-bucket/
+uv run yt-process "gs://your-bucket/video.mp4" \
+  -v --vertex --project your-gcp-project
 ```
 
 ## Analysis Modes

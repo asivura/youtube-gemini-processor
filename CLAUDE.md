@@ -48,16 +48,46 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 ## Input Types
 
 - **YouTube URLs** - Passed directly to Gemini via `file_uri`
-- **Local files** - Uploaded via Gemini Files API, then processed
+- **Local files** - Uploaded via Gemini Files API, then processed (API key only, not Vertex AI)
+- **GCS URIs** - `gs://` paths processed directly via Vertex AI
 
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
 
+### GCS Bucket for Video Processing
+
+For Vertex AI processing (when `GOOGLE_GENAI_USE_VERTEXAI=true`), local files must be uploaded to GCS first since the Files API is not supported with Vertex AI.
+
+- **Bucket**: `gs://asivura-video-processing/`
+- **Project**: `pandb-content-poc`
+
+```bash
+# Upload and process
+gcloud storage cp "./video.mp4" gs://asivura-video-processing/
+uv run yt-process "gs://asivura-video-processing/video.mp4" \
+  -v --vertex --project pandb-content-poc
+```
+
 ## Analysis Modes
 
-Three hardcoded prompts in `cli.py`:
+Four hardcoded prompts in `cli.py`:
 - `DEFAULT_PROMPT` (comprehensive) - Full transcript, visuals, summary, glossary
 - `CONCISE_PROMPT` - Quick summary with key points
 - `TRANSCRIPT_ONLY_PROMPT` - Transcript with visual markers
+- `SEGMENTS_PROMPT` - Identify logical sections with timestamps, titles, speakers, and summaries (uses `response_schema` for guaranteed valid JSON output)
+
+### Segments Mode
+
+The `--mode segments` option uses Gemini to identify logical sections of a video. It returns structured JSON with segment boundaries. Use `--split` to also split the video into separate files via ffmpeg.
+
+```bash
+# Identify segments
+yt-process "./video.mp4" --mode segments
+
+# Identify and split into files
+yt-process "./video.mp4" --mode segments --split
+```
+
+**Note**: `--split` requires ffmpeg and only works with local files.
 
 ## Authentication
 

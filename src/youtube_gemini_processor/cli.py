@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -261,10 +263,52 @@ Also note any significant visual content shown (slides, demos) in brackets like:
 [MM:SS] [DEMO: What is being demonstrated]"""
 
 
+SEGMENTS_PROMPT = """You are an expert video analyst. Watch this ENTIRE video carefully from start to finish and identify all logical sections/segments.
+{duration_line}
+# INSTRUCTIONS
+- Identify every major topic change, speaker transition, or agenda item boundary
+- Focus on semantic/content transitions, not minor pauses
+- Each segment should represent a coherent topic or agenda item
+- Provide accurate timestamps in HH:MM:SS format
+
+# OUTPUT FORMAT
+
+Return ONLY a JSON array (no markdown fencing, no other text) with this structure:
+
+[
+  {{
+    "segment_number": 1,
+    "start_time": "00:00:00",
+    "end_time": "00:05:30",
+    "title": "Opening Remarks",
+    "speaker": "Speaker Name (if identifiable)",
+    "summary": "Brief 1-2 sentence summary of what happens in this segment"
+  }},
+  {{
+    "segment_number": 2,
+    "start_time": "00:05:30",
+    "end_time": "00:15:00",
+    "title": "Product Update",
+    "speaker": "Speaker Name",
+    "summary": "Brief summary"
+  }}
+]
+
+# CRITICAL RULES
+- Return ONLY the JSON array, no other text or markdown
+- Cover the ENTIRE video from start to finish with no gaps
+- The LAST segment's end_time MUST match the video's total duration
+- Each segment's start_time should equal the previous segment's end_time
+- Use HH:MM:SS format for all timestamps
+- Be specific with segment titles (not generic like "Section 1")
+- Include speaker name if identifiable, otherwise use "Unknown" or a description"""
+
+
 PROMPTS = {
     "comprehensive": DEFAULT_PROMPT,
     "concise": CONCISE_PROMPT,
     "transcript": TRANSCRIPT_ONLY_PROMPT,
+    "segments": SEGMENTS_PROMPT,
 }
 
 # Pricing per 1M tokens (as of Jan 2025)
@@ -290,6 +334,31 @@ MODEL_MAX_OUTPUT_TOKENS = {
 def get_max_output_tokens(model: str) -> int:
     """Get maximum output tokens for a model."""
     return MODEL_MAX_OUTPUT_TOKENS.get(model, 8192)
+
+
+# JSON Schema for segments mode - enforces structured output from Gemini
+SEGMENTS_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "segment_number": {"type": "INTEGER"},
+            "start_time": {"type": "STRING"},
+            "end_time": {"type": "STRING"},
+            "title": {"type": "STRING"},
+            "speaker": {"type": "STRING"},
+            "summary": {"type": "STRING"},
+        },
+        "required": [
+            "segment_number",
+            "start_time",
+            "end_time",
+            "title",
+            "speaker",
+            "summary",
+        ],
+    },
+}
 
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageStats:
@@ -437,6 +506,39 @@ def is_gcs_uri(uri: str) -> bool:
     return uri.startswith("gs://")
 
 
+def get_video_duration(file_path: str) -> str | None:
+    """Get video duration in HH:MM:SS format using ffprobe.
+
+    Returns None if ffprobe is not available or fails.
+    """
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        seconds = float(result.stdout.strip())
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    except (ValueError, OSError):
+        return None
+
+
 def get_video_mime_type(file_path: Path) -> str:
     """Get MIME type for a video file based on extension."""
     ext = file_path.suffix.lower()
@@ -455,6 +557,7 @@ def process_local_file(
     prompt: str,
     model: str = "gemini-3-flash-preview",
     verbose: bool = False,
+    response_schema: dict | None = None,
 ) -> VideoAnalysis:
     """Process a local video file with Gemini API using Files API."""
     from google.genai import types
@@ -492,6 +595,14 @@ def process_local_file(
         if uploaded_file.state.name == "FAILED":
             raise click.ClickException(f"File processing failed: {uploaded_file.name}")
 
+        # Build config
+        config_kwargs: dict = {
+            "max_output_tokens": get_max_output_tokens(model),
+        }
+        if response_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = response_schema
+
         # Generate content using the uploaded file
         response = client.models.generate_content(
             model=model,
@@ -509,9 +620,7 @@ def process_local_file(
                     ],
                 )
             ],
-            config=types.GenerateContentConfig(
-                max_output_tokens=get_max_output_tokens(model),
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
 
         analysis.raw_response = response.text
@@ -555,6 +664,7 @@ def process_gcs_uri(
     prompt: str,
     model: str = "gemini-3-flash-preview",
     verbose: bool = False,
+    response_schema: dict | None = None,
 ) -> VideoAnalysis:
     """Process a video from Google Cloud Storage with Gemini API."""
     from google.genai import types
@@ -576,6 +686,14 @@ def process_gcs_uri(
         if verbose:
             click.echo(f"  Processing GCS file: {filename}", err=True)
 
+        # Build config
+        config_kwargs: dict = {
+            "max_output_tokens": get_max_output_tokens(model),
+        }
+        if response_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = response_schema
+
         response = client.models.generate_content(
             model=model,
             contents=[
@@ -592,9 +710,7 @@ def process_gcs_uri(
                     ],
                 )
             ],
-            config=types.GenerateContentConfig(
-                max_output_tokens=get_max_output_tokens(model),
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
 
         analysis.raw_response = response.text
@@ -637,6 +753,7 @@ def process_video(
     url: str,
     prompt: str,
     model: str = "gemini-3-flash-preview",
+    response_schema: dict | None = None,
 ) -> VideoAnalysis:
     """Process a single YouTube video with Gemini API."""
     from google.genai import types
@@ -650,6 +767,14 @@ def process_video(
     )
 
     try:
+        # Build config
+        config_kwargs: dict = {
+            "max_output_tokens": get_max_output_tokens(model),
+        }
+        if response_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = response_schema
+
         response = client.models.generate_content(
             model=model,
             contents=[
@@ -666,9 +791,7 @@ def process_video(
                     ],
                 )
             ],
-            config=types.GenerateContentConfig(
-                max_output_tokens=get_max_output_tokens(model),
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
 
         analysis.raw_response = response.text
@@ -702,6 +825,206 @@ def process_video(
         analysis.error = str(e)
 
     return analysis
+
+
+def parse_segments(raw_response: str) -> list[dict]:
+    """Parse segment data from Gemini's JSON response.
+
+    Handles responses that may contain markdown fencing or extra text around the JSON.
+    """
+    text = raw_response.strip()
+
+    # Strip markdown code fences if present
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+
+    # Try to find JSON array in the text
+    bracket_start = text.find("[")
+    bracket_end = text.rfind("]")
+    if bracket_start != -1 and bracket_end != -1:
+        text = text[bracket_start : bracket_end + 1]
+
+    try:
+        segments = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(
+            f"Failed to parse segments JSON from response: {e}"
+        ) from None
+
+    if not isinstance(segments, list) or not segments:
+        raise click.ClickException("Response did not contain a valid segments array")
+
+    return segments
+
+
+def format_segments_markdown(analysis: VideoAnalysis, segments: list[dict]) -> str:
+    """Format segment analysis as a readable markdown document."""
+    if analysis.error:
+        return f"# Error Processing Video\n\n**URL**: {analysis.url}\n\n**Error**: {analysis.error}\n"
+
+    usage_section = ""
+    if analysis.usage:
+        u = analysis.usage
+        usage_section = f"""
+**Usage**: {u.input_tokens:,} input + {u.output_tokens:,} output = {u.total_tokens:,} tokens
+**Cost**: ${u.total_cost:.6f} (${u.input_cost:.6f} input + ${u.output_cost:.6f} output)
+"""
+
+    lines = [
+        "# Video Segments Analysis",
+        "",
+        f"**Source**: {analysis.url}",
+        f"**Processed**: {analysis.processed_at}",
+        f"**Model**: {analysis.model}{usage_section}",
+        "",
+        "---",
+        "",
+        "## Segments",
+        "",
+        "| # | Start | End | Title | Speaker |",
+        "|---|-------|-----|-------|---------|",
+    ]
+
+    for seg in segments:
+        num = seg.get("segment_number", "")
+        start = seg.get("start_time", "")
+        end = seg.get("end_time", "")
+        title = seg.get("title", "")
+        speaker = seg.get("speaker", "")
+        lines.append(f"| {num} | {start} | {end} | {title} | {speaker} |")
+
+    lines.extend(["", "---", "", "## Segment Details", ""])
+
+    for seg in segments:
+        num = seg.get("segment_number", "")
+        title = seg.get("title", "Untitled")
+        start = seg.get("start_time", "")
+        end = seg.get("end_time", "")
+        speaker = seg.get("speaker", "")
+        summary = seg.get("summary", "")
+
+        lines.append(f"### {num}. {title} [{start} - {end}]")
+        if speaker:
+            lines.append(f"**Speaker**: {speaker}")
+        lines.append("")
+        lines.append(summary)
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_segments_json(analysis: VideoAnalysis, segments: list[dict]) -> str:
+    """Format segment analysis as JSON."""
+    usage_dict = None
+    if analysis.usage:
+        u = analysis.usage
+        usage_dict = {
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "total_tokens": u.total_tokens,
+            "input_cost_usd": u.input_cost,
+            "output_cost_usd": u.output_cost,
+            "total_cost_usd": u.total_cost,
+        }
+    return json.dumps(
+        {
+            "url": analysis.url,
+            "processed_at": analysis.processed_at,
+            "model": analysis.model,
+            "segments": segments,
+            "usage": usage_dict,
+            "error": analysis.error,
+        },
+        indent=2,
+    )
+
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize a string for use as a filename."""
+    # Replace spaces with underscores, remove non-alphanumeric chars except underscore/dash
+    sanitized = re.sub(r"[^\w\s-]", "", name)
+    sanitized = re.sub(r"\s+", "_", sanitized).strip("_")
+    return sanitized[:80]  # Limit length
+
+
+def split_video(
+    file_path: str,
+    segments: list[dict],
+    output_dir: Path | None = None,
+    verbose: bool = False,
+) -> list[Path]:
+    """Split a video file into segments using ffmpeg.
+
+    Args:
+        file_path: Path to the source video file.
+        segments: List of segment dicts with start_time and end_time.
+        output_dir: Directory for output files. Defaults to same directory as source.
+        verbose: Print progress messages.
+
+    Returns:
+        List of paths to the created segment files.
+    """
+    if not shutil.which("ffmpeg"):
+        raise click.ClickException(
+            "ffmpeg is required for --split but was not found on PATH"
+        )
+
+    source = Path(file_path).resolve()
+    dest_dir = output_dir or source.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    created_files: list[Path] = []
+
+    for seg in segments:
+        num = seg.get("segment_number", 0)
+        title = _sanitize_filename(seg.get("title", f"segment_{num}"))
+        start = seg.get("start_time", "00:00:00")
+        end = seg.get("end_time", "")
+
+        out_name = f"{source.stem}_{num:02d}_{title}{source.suffix}"
+        out_path = dest_dir / out_name
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-ss",
+            start,
+            "-to",
+            end,
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(out_path),
+        ]
+
+        if verbose:
+            click.echo(
+                f"  Splitting segment {num}: {title} ({start} - {end})", err=True
+            )
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            click.echo(
+                f"  Warning: ffmpeg failed for segment {num}: {result.stderr[:200]}",
+                err=True,
+            )
+        else:
+            created_files.append(out_path)
+            if verbose:
+                size_mb = out_path.stat().st_size / (1024 * 1024)
+                click.echo(f"    Created: {out_path.name} ({size_mb:.1f} MB)", err=True)
+
+    return created_files
 
 
 def format_output_markdown(analysis: VideoAnalysis) -> str:
@@ -803,7 +1126,7 @@ def get_safe_filename(input_source: str) -> str:
 @click.option(
     "--mode",
     "-m",
-    type=click.Choice(["comprehensive", "concise", "transcript"]),
+    type=click.Choice(["comprehensive", "concise", "transcript", "segments"]),
     default="comprehensive",
     help="Analysis mode (default: comprehensive)",
 )
@@ -854,6 +1177,11 @@ def get_safe_filename(input_source: str) -> str:
     is_flag=True,
     help="Verbose output",
 )
+@click.option(
+    "--split",
+    is_flag=True,
+    help="Split video into segments using ffmpeg (requires --mode segments and a local file)",
+)
 @click.version_option()
 def main(
     input: str | None,
@@ -868,6 +1196,7 @@ def main(
     project: str | None,
     location: str | None,
     verbose: bool,
+    split: bool,
 ):
     """
     Process videos using Google's Gemini API.
@@ -892,6 +1221,12 @@ def main(
 
         # Transcript only
         yt-process ./meeting.mp4 -m transcript
+
+        # Identify video segments
+        yt-process ./meeting.mp4 -m segments
+
+        # Identify segments and split into separate files
+        yt-process ./meeting.mp4 -m segments --split
 
         # Batch process from file
         yt-process --batch inputs.txt -o ./output/
@@ -929,6 +1264,9 @@ def main(
     if input and batch:
         raise click.ClickException("Cannot specify both INPUT and --batch")
 
+    if split and mode != "segments" and not prompt:
+        raise click.ClickException("--split requires --mode segments")
+
     # Auto-detect location based on model if not specified
     if location is None:
         if model.startswith("gemini-3"):
@@ -945,6 +1283,7 @@ def main(
     )
 
     # Determine prompt
+    is_segments_mode = mode == "segments" and not prompt
     analysis_prompt = prompt if prompt else PROMPTS[mode]
 
     # Collect inputs to process (URLs or file paths)
@@ -963,19 +1302,20 @@ def main(
 
     # Determine output handling
     is_batch = len(inputs) > 1
-    output_dir: Path | None = None
+    output_dir_path: Path | None = None
     output_file: Path | None = None
 
     if output:
         output_path = Path(output)
         if is_batch or output_path.is_dir():
-            output_dir = output_path
-            output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir_path = output_path
+            output_dir_path.mkdir(parents=True, exist_ok=True)
         else:
             output_file = output_path
 
     # Process videos
     results: list[VideoAnalysis] = []
+
     formatter = (
         format_output_json if output_format == "json" else format_output_markdown
     )
@@ -991,26 +1331,74 @@ def main(
             if verbose:
                 click.echo(f"\nProcessing: {video_input}")
 
+            # Use response schema for segments mode to guarantee valid JSON
+            schema = SEGMENTS_SCHEMA if is_segments_mode else None
+
+            # For segments mode, detect video duration and inject into prompt
+            video_prompt = analysis_prompt
+            if is_segments_mode and is_local_file(video_input):
+                duration = get_video_duration(video_input)
+                if duration:
+                    duration_line = (
+                        f"\nThe video is exactly {duration} long. "
+                        f"You MUST cover from 00:00:00 to {duration}.\n"
+                    )
+                    if verbose:
+                        click.echo(f"  Detected video duration: {duration}", err=True)
+                else:
+                    duration_line = ""
+                video_prompt = analysis_prompt.format(duration_line=duration_line)
+            elif is_segments_mode:
+                video_prompt = analysis_prompt.format(duration_line="")
+
             # Detect input type and process accordingly
             if is_local_file(video_input):
                 analysis = process_local_file(
-                    client, video_input, analysis_prompt, model, verbose
+                    client, video_input, video_prompt, model, verbose, schema
                 )
             elif is_gcs_uri(video_input):
                 analysis = process_gcs_uri(
-                    client, video_input, analysis_prompt, model, verbose
+                    client, video_input, video_prompt, model, verbose, schema
                 )
             else:
-                analysis = process_video(client, video_input, analysis_prompt, model)
+                analysis = process_video(
+                    client, video_input, video_prompt, model, schema
+                )
             results.append(analysis)
 
-            # Output handling
-            formatted = formatter(analysis)
+            # Segments mode: parse and format with segment-specific formatters
+            if is_segments_mode and not analysis.error:
+                segments = parse_segments(analysis.raw_response)
 
-            if output_dir:
+                if output_format == "json":
+                    formatted = format_segments_json(analysis, segments)
+                else:
+                    formatted = format_segments_markdown(analysis, segments)
+
+                # Split video if requested
+                if split and is_local_file(video_input):
+                    split_dir = output_dir_path or Path(video_input).resolve().parent
+                    click.echo(
+                        f"\nSplitting video into {len(segments)} segments...",
+                        err=True,
+                    )
+                    created = split_video(video_input, segments, split_dir, verbose)
+                    click.echo(
+                        f"Created {len(created)} segment files in {split_dir}",
+                        err=True,
+                    )
+                elif split and not is_local_file(video_input):
+                    click.echo(
+                        "Warning: --split only works with local video files",
+                        err=True,
+                    )
+            else:
+                formatted = formatter(analysis)
+
+            if output_dir_path:
                 # Batch mode: write each to separate file
                 filename = f"{get_safe_filename(video_input)}.{extension}"
-                file_path = output_dir / filename
+                file_path = output_dir_path / filename
                 file_path.write_text(formatted)
                 if verbose:
                     click.echo(f"  Saved to: {file_path}")

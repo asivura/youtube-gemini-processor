@@ -506,6 +506,40 @@ def is_gcs_uri(uri: str) -> bool:
     return uri.startswith("gs://")
 
 
+def is_files_api_ref(input_str: str) -> bool:
+    """Check if input is a Files API reference.
+
+    Accepts either the short name format (files/abc123) or the full URI
+    (https://generativelanguage.googleapis.com/v1beta/files/abc123).
+    """
+    return input_str.startswith("files/") or (
+        "generativelanguage.googleapis.com" in input_str and "/files/" in input_str
+    )
+
+
+def normalize_files_api_ref(input_str: str) -> str:
+    """Extract the Files API name (files/xxx) from a name or full URI.
+
+    Args:
+        input_str: Either "files/abc123" or a full URI containing "/files/abc123".
+
+    Returns:
+        The normalized name in "files/xxx" format.
+
+    Raises:
+        click.ClickException: If the input cannot be parsed as a Files API reference.
+    """
+    if input_str.startswith("files/"):
+        return input_str
+    match = re.search(r"(files/[a-zA-Z0-9_-]+)", input_str)
+    if match:
+        return match.group(1)
+    raise click.ClickException(
+        f"Invalid Files API reference: {input_str}\n"
+        "Expected format: files/abc123 or full URI"
+    )
+
+
 def get_video_duration(file_path: str) -> str | None:
     """Get video duration in HH:MM:SS format using ffprobe.
 
@@ -580,8 +614,10 @@ def process_local_file(
         # Upload file using Files API
         uploaded_file = client.files.upload(file=str(path))
 
-        if verbose:
-            click.echo(f"  File uploaded: {uploaded_file.name}", err=True)
+        click.echo(
+            f"  Uploaded: {uploaded_file.name} (reuse with: yt-process {uploaded_file.name})",
+            err=True,
+        )
 
         # Wait for file to be processed
         import time
@@ -652,6 +688,125 @@ def process_local_file(
         if summary_match:
             analysis.summary = summary_match.group(1).strip()
 
+    except Exception as e:
+        analysis.error = str(e)
+
+    return analysis
+
+
+def process_files_api_ref(
+    client,
+    file_ref: str,
+    prompt: str,
+    model: str = "gemini-3-flash-preview",
+    verbose: bool = False,
+    response_schema: dict | None = None,
+) -> VideoAnalysis:
+    """Process a video using an existing Files API reference.
+
+    Skips upload entirely and uses a previously uploaded file.
+    Files API references expire after 48 hours.
+    """
+    import time
+
+    from google.genai import types
+
+    file_name = normalize_files_api_ref(file_ref)
+
+    analysis = VideoAnalysis(
+        url=file_ref,
+        processed_at=datetime.now().isoformat(),
+        model=model,
+    )
+
+    try:
+        if verbose:
+            click.echo(f"  Looking up file: {file_name}", err=True)
+
+        try:
+            file_info = client.files.get(name=file_name)
+        except Exception as e:
+            raise click.ClickException(
+                f"File not found: {file_name}\n"
+                "It may have expired (48h limit) or been deleted.\n"
+                f"Error: {e}"
+            ) from None
+
+        # Wait if still processing
+        while file_info.state.name == "PROCESSING":
+            if verbose:
+                click.echo("  Waiting for file processing...", err=True)
+            time.sleep(2)
+            file_info = client.files.get(name=file_name)
+
+        if file_info.state.name == "FAILED":
+            raise click.ClickException(f"File processing failed: {file_name}")
+
+        # Use MIME type from file metadata, fall back to video/mp4
+        mime_type = getattr(file_info, "mime_type", None) or "video/mp4"
+
+        if verbose:
+            click.echo(f"  Using file: {file_info.name} ({mime_type})", err=True)
+
+        # Build config
+        config_kwargs: dict = {
+            "max_output_tokens": get_max_output_tokens(model),
+        }
+        if response_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = response_schema
+
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            file_data=types.FileData(
+                                file_uri=file_info.uri,
+                                mime_type=mime_type,
+                            )
+                        ),
+                        types.Part(text=prompt),
+                    ],
+                )
+            ],
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+
+        analysis.raw_response = response.text
+
+        # Extract usage stats from response
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            usage = response.usage_metadata
+            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
+
+        # Try to extract title from response
+        title_match = re.search(
+            r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
+            response.text,
+            re.IGNORECASE,
+        )
+        if title_match:
+            analysis.title = title_match.group(1).strip()
+        else:
+            display = getattr(file_info, "display_name", None) or file_name
+            analysis.title = Path(display).stem
+
+        # Extract summary if present
+        summary_match = re.search(
+            r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
+            response.text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if summary_match:
+            analysis.summary = summary_match.group(1).strip()
+
+    except click.ClickException:
+        raise
     except Exception as e:
         analysis.error = str(e)
 
@@ -1088,6 +1243,11 @@ def get_safe_filename(input_source: str) -> str:
     if path.exists() and path.is_file():
         return path.stem  # Return filename without extension
 
+    # Check if it's a Files API reference
+    if is_files_api_ref(input_source):
+        name = normalize_files_api_ref(input_source)
+        return name.replace("/", "_")
+
     # Check if it's a GCS URI
     if input_source.startswith("gs://"):
         filename = input_source.split("/")[-1]
@@ -1182,6 +1342,22 @@ def get_safe_filename(input_source: str) -> str:
     is_flag=True,
     help="Split video into segments using ffmpeg (requires --mode segments and a local file)",
 )
+@click.option(
+    "--upload-only",
+    is_flag=True,
+    help="Upload file to Files API and print reference without processing",
+)
+@click.option(
+    "--list-files",
+    is_flag=True,
+    help="List all files uploaded to the Files API",
+)
+@click.option(
+    "--delete-file",
+    type=str,
+    default=None,
+    help="Delete a Files API reference (e.g. files/abc123)",
+)
 @click.version_option()
 def main(
     input: str | None,
@@ -1197,11 +1373,14 @@ def main(
     location: str | None,
     verbose: bool,
     split: bool,
+    upload_only: bool,
+    list_files: bool,
+    delete_file: str | None,
 ):
     """
     Process videos using Google's Gemini API.
 
-    Supports YouTube URLs and local video files.
+    Supports YouTube URLs, local video files, and Files API references.
     Extracts comprehensive content including transcripts and visual descriptions
     (slides, diagrams, charts, demonstrations).
 
@@ -1235,6 +1414,21 @@ def main(
         yt-process ./video.mp4 -f json
 
     \b
+    Files API (upload once, reuse for 48 hours):
+        # Upload and get reference
+        yt-process ./video.mp4 --upload-only
+
+        # Process using saved reference (no re-upload)
+        yt-process files/abc123 -m comprehensive
+        yt-process files/abc123 -m segments
+
+        # List uploaded files
+        yt-process --list-files
+
+        # Delete a file
+        yt-process --delete-file files/abc123
+
+    \b
     Supported Video Formats:
         .mp4, .mpeg, .mov, .avi, .webm, .wmv, .flv, .mkv, .3gp
 
@@ -1256,6 +1450,43 @@ def main(
         GOOGLE_CLOUD_LOCATION    GCP location (default: us-central1)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
     """
+    # Auto-detect location based on model if not specified
+    if location is None:
+        if model.startswith("gemini-3"):
+            location = "global"
+        else:
+            location = "us-central1"
+
+    # Handle file management operations (no INPUT required)
+    if list_files or delete_file:
+        client = get_gemini_client(
+            api_key=api_key,
+            use_vertex=vertex,
+            project=project,
+            location=location,
+        )
+        if list_files:
+            click.echo("Uploaded files:", err=True)
+            found = False
+            for f in client.files.list():
+                found = True
+                state = getattr(f.state, "name", "UNKNOWN")
+                display = getattr(f, "display_name", "") or ""
+                expire = getattr(f, "expiration_time", "") or ""
+                line = f"  {f.name:<30} {state:<10}"
+                if display:
+                    line += f" {display}"
+                if expire:
+                    line += f"  (expires: {expire})"
+                click.echo(line)
+            if not found:
+                click.echo("  (no files uploaded)")
+        if delete_file:
+            name = normalize_files_api_ref(delete_file)
+            client.files.delete(name=name)
+            click.echo(f"Deleted: {name}", err=True)
+        return
+
     if not input and not batch:
         raise click.ClickException(
             "Either INPUT (URL or file path) or --batch file is required"
@@ -1267,12 +1498,8 @@ def main(
     if split and mode != "segments" and not prompt:
         raise click.ClickException("--split requires --mode segments")
 
-    # Auto-detect location based on model if not specified
-    if location is None:
-        if model.startswith("gemini-3"):
-            location = "global"
-        else:
-            location = "us-central1"
+    if upload_only and batch:
+        raise click.ClickException("--upload-only cannot be used with --batch")
 
     # Initialize client
     client = get_gemini_client(
@@ -1281,6 +1508,39 @@ def main(
         project=project,
         location=location,
     )
+
+    # Handle upload-only mode
+    if upload_only:
+        if not input or not is_local_file(input):
+            raise click.ClickException(
+                "--upload-only requires a local file path as input"
+            )
+        import time
+
+
+        path = Path(input).resolve()
+        mime_type = get_video_mime_type(path)
+        file_size_mb = path.stat().st_size / (1024 * 1024)
+
+        click.echo(f"Uploading {path.name} ({file_size_mb:.1f} MB)...", err=True)
+        uploaded_file = client.files.upload(file=str(path))
+        click.echo("Waiting for processing...", err=True)
+
+        while uploaded_file.state.name == "PROCESSING":
+            time.sleep(2)
+            uploaded_file = client.files.get(name=uploaded_file.name)
+
+        if uploaded_file.state.name == "FAILED":
+            raise click.ClickException(f"File processing failed: {uploaded_file.name}")
+
+        click.echo(uploaded_file.name)
+        if verbose:
+            click.echo(f"  URI: {uploaded_file.uri}", err=True)
+            click.echo(f"  MIME type: {mime_type}", err=True)
+            expire = getattr(uploaded_file, "expiration_time", None)
+            if expire:
+                click.echo(f"  Expires: {expire}", err=True)
+        return
 
     # Determine prompt
     is_segments_mode = mode == "segments" and not prompt
@@ -1354,6 +1614,10 @@ def main(
             # Detect input type and process accordingly
             if is_local_file(video_input):
                 analysis = process_local_file(
+                    client, video_input, video_prompt, model, verbose, schema
+                )
+            elif is_files_api_ref(video_input):
+                analysis = process_files_api_ref(
                     client, video_input, video_prompt, model, verbose, schema
                 )
             elif is_gcs_uri(video_input):

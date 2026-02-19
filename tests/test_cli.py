@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -23,10 +24,13 @@ from youtube_gemini_processor.cli import (
     format_segments_markdown,
     get_safe_filename,
     get_video_mime_type,
+    is_files_api_ref,
     is_local_file,
     is_youtube_url,
     main,
+    normalize_files_api_ref,
     parse_segments,
+    process_files_api_ref,
     split_video,
     validate_youtube_url,
 )
@@ -1044,3 +1048,380 @@ class TestCLISegmentsMode:
         # Should not crash with UnboundLocalError, should show error in output
         assert result.exit_code == 0
         assert "Error" in result.output
+
+
+class TestIsFilesApiRef:
+    """Tests for is_files_api_ref function."""
+
+    def test_name_format_returns_true(self) -> None:
+        """Test that files/xxx format returns True."""
+        assert is_files_api_ref("files/abc123") is True
+
+    def test_name_with_dashes_returns_true(self) -> None:
+        """Test that files/ name with dashes returns True."""
+        assert is_files_api_ref("files/abc-123_def") is True
+
+    def test_full_uri_returns_true(self) -> None:
+        """Test that full generativelanguage URI returns True."""
+        uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        assert is_files_api_ref(uri) is True
+
+    def test_youtube_url_returns_false(self) -> None:
+        """Test that YouTube URLs return False."""
+        assert is_files_api_ref("https://www.youtube.com/watch?v=abc123") is False
+
+    def test_local_path_returns_false(self) -> None:
+        """Test that local file paths return False."""
+        assert is_files_api_ref("/tmp/video.mp4") is False
+
+    def test_gcs_uri_returns_false(self) -> None:
+        """Test that GCS URIs return False."""
+        assert is_files_api_ref("gs://bucket/video.mp4") is False
+
+    def test_empty_string_returns_false(self) -> None:
+        """Test that empty string returns False."""
+        assert is_files_api_ref("") is False
+
+
+class TestNormalizeFilesApiRef:
+    """Tests for normalize_files_api_ref function."""
+
+    def test_name_format_unchanged(self) -> None:
+        """Test that files/xxx passes through unchanged."""
+        assert normalize_files_api_ref("files/abc123") == "files/abc123"
+
+    def test_uri_format_extracts_name(self) -> None:
+        """Test that full URI is normalized to name format."""
+        uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        assert normalize_files_api_ref(uri) == "files/abc123"
+
+    def test_invalid_format_raises_error(self) -> None:
+        """Test that invalid input raises ClickException."""
+        with pytest.raises(click.ClickException, match="Invalid Files API reference"):
+            normalize_files_api_ref("not-a-valid-ref")
+
+
+class TestProcessFilesApiRef:
+    """Tests for process_files_api_ref function."""
+
+    def test_active_file_processes_successfully(self) -> None:
+        """Test that an active file is processed without upload."""
+        mock_client = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "files/abc123"
+        mock_file.uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        mock_file.state.name = "ACTIVE"
+        mock_file.mime_type = "video/mp4"
+        mock_file.display_name = "test_video.mp4"
+        mock_client.files.get.return_value = mock_file
+
+        mock_response = MagicMock()
+        mock_response.text = "# Analysis\n\nTest content"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        analysis = process_files_api_ref(
+            mock_client, "files/abc123", "Analyze this video"
+        )
+
+        assert analysis.error is None
+        assert analysis.raw_response == "# Analysis\n\nTest content"
+        mock_client.files.get.assert_called_once_with(name="files/abc123")
+        # Should NOT call files.upload
+        mock_client.files.upload.assert_not_called()
+
+    def test_processing_file_waits_then_processes(self) -> None:
+        """Test that a PROCESSING file is polled until ACTIVE."""
+        mock_client = MagicMock()
+
+        mock_file_processing = MagicMock()
+        mock_file_processing.name = "files/abc123"
+        mock_file_processing.state.name = "PROCESSING"
+
+        mock_file_active = MagicMock()
+        mock_file_active.name = "files/abc123"
+        mock_file_active.uri = (
+            "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        )
+        mock_file_active.state.name = "ACTIVE"
+        mock_file_active.mime_type = "video/mp4"
+        mock_file_active.display_name = "test.mp4"
+
+        mock_client.files.get.side_effect = [
+            mock_file_processing,
+            mock_file_active,
+            mock_file_active,
+        ]
+
+        mock_response = MagicMock()
+        mock_response.text = "Analysis"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch("time.sleep"):
+            analysis = process_files_api_ref(mock_client, "files/abc123", "Analyze")
+
+        assert analysis.error is None
+        assert mock_client.files.get.call_count >= 2
+
+    def test_failed_file_raises_error(self) -> None:
+        """Test that a FAILED file raises ClickException."""
+        mock_client = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "files/abc123"
+        mock_file.state.name = "FAILED"
+        mock_client.files.get.return_value = mock_file
+
+        with pytest.raises(click.ClickException, match="File processing failed"):
+            process_files_api_ref(mock_client, "files/abc123", "Analyze")
+
+    def test_not_found_raises_helpful_error(self) -> None:
+        """Test that a missing file raises a helpful error."""
+        mock_client = MagicMock()
+        mock_client.files.get.side_effect = Exception("404 Not Found")
+
+        with pytest.raises(click.ClickException, match="expired"):
+            process_files_api_ref(mock_client, "files/expired123", "Analyze")
+
+    def test_full_uri_input_works(self) -> None:
+        """Test that full URI format is accepted as input."""
+        mock_client = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "files/abc123"
+        mock_file.uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        mock_file.state.name = "ACTIVE"
+        mock_file.mime_type = "video/mp4"
+        mock_file.display_name = None
+        mock_client.files.get.return_value = mock_file
+
+        mock_response = MagicMock()
+        mock_response.text = "Analysis"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        analysis = process_files_api_ref(mock_client, uri, "Analyze")
+
+        assert analysis.error is None
+        mock_client.files.get.assert_called_once_with(name="files/abc123")
+
+    def test_mime_type_fallback_to_video_mp4(self) -> None:
+        """Test that missing mime_type falls back to video/mp4."""
+        mock_client = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "files/abc123"
+        mock_file.uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        mock_file.state.name = "ACTIVE"
+        mock_file.mime_type = None
+        mock_file.display_name = None
+        mock_client.files.get.return_value = mock_file
+
+        mock_response = MagicMock()
+        mock_response.text = "Analysis"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        analysis = process_files_api_ref(mock_client, "files/abc123", "Analyze")
+
+        assert analysis.error is None
+        # Verify video/mp4 was used as fallback
+        call_args = mock_client.models.generate_content.call_args
+        content = call_args.kwargs["contents"][0]
+        file_data = content.parts[0].file_data
+        assert file_data.mime_type == "video/mp4"
+
+
+class TestCLIUploadOnly:
+    """Tests for --upload-only flag."""
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_upload_only_prints_reference(
+        self, mock_get_client: MagicMock, tmp_path: Path
+    ) -> None:
+        """Test --upload-only uploads and prints file reference."""
+        test_file = tmp_path / "test_video.mp4"
+        test_file.write_bytes(b"fake video content")
+
+        mock_client = MagicMock()
+        mock_uploaded_file = MagicMock()
+        mock_uploaded_file.name = "files/abc123"
+        mock_uploaded_file.uri = (
+            "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        )
+        mock_uploaded_file.state.name = "ACTIVE"
+        mock_client.files.upload.return_value = mock_uploaded_file
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                str(test_file),
+                "--upload-only",
+                "--api-key",
+                "fake-key",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "files/abc123" in result.output
+        # Should NOT call generate_content
+        mock_client.models.generate_content.assert_not_called()
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_upload_only_with_youtube_url_errors(
+        self, mock_get_client: MagicMock
+    ) -> None:
+        """Test --upload-only with YouTube URL shows error."""
+        mock_get_client.return_value = MagicMock()
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "https://www.youtube.com/watch?v=test123",
+                "--upload-only",
+                "--api-key",
+                "fake-key",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert (
+            "local file" in result.output.lower()
+            or "local file" in str(result.exception).lower()
+        )
+
+
+class TestCLIFilesManagement:
+    """Tests for --list-files and --delete-file flags."""
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_list_files_shows_uploaded_files(self, mock_get_client: MagicMock) -> None:
+        """Test --list-files displays file list."""
+        mock_client = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "files/abc123"
+        mock_file.state.name = "ACTIVE"
+        mock_file.display_name = "video.mp4"
+        mock_file.expiration_time = "2026-02-20T10:00:00Z"
+        mock_client.files.list.return_value = [mock_file]
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["--list-files", "--api-key", "fake-key"],
+        )
+
+        assert result.exit_code == 0
+        assert "files/abc123" in result.output
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_list_files_empty(self, mock_get_client: MagicMock) -> None:
+        """Test --list-files with no files shows message."""
+        mock_client = MagicMock()
+        mock_client.files.list.return_value = []
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["--list-files", "--api-key", "fake-key"],
+        )
+
+        assert result.exit_code == 0
+        assert "no files" in result.output.lower()
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_delete_file_calls_api(self, mock_get_client: MagicMock) -> None:
+        """Test --delete-file calls files.delete."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["--delete-file", "files/abc123", "--api-key", "fake-key"],
+        )
+
+        assert result.exit_code == 0
+        mock_client.files.delete.assert_called_once_with(name="files/abc123")
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_list_files_without_input_allowed(self, mock_get_client: MagicMock) -> None:
+        """Test --list-files works without INPUT argument."""
+        mock_client = MagicMock()
+        mock_client.files.list.return_value = []
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["--list-files", "--api-key", "fake-key"],
+        )
+
+        # Should not fail with "INPUT required" error
+        assert result.exit_code == 0
+
+
+class TestCLIFilesApiInput:
+    """Tests for using Files API reference as INPUT."""
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_files_ref_skips_upload(self, mock_get_client: MagicMock) -> None:
+        """Test that files/ reference skips upload and uses files.get."""
+        mock_client = MagicMock()
+        mock_file = MagicMock()
+        mock_file.name = "files/abc123"
+        mock_file.uri = "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        mock_file.state.name = "ACTIVE"
+        mock_file.mime_type = "video/mp4"
+        mock_file.display_name = "test.mp4"
+        mock_client.files.get.return_value = mock_file
+
+        mock_response = MagicMock()
+        mock_response.text = "# Analysis\n\nContent"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["files/abc123", "--api-key", "fake-key"],
+        )
+
+        assert result.exit_code == 0
+        # Should call files.get, NOT files.upload
+        mock_client.files.get.assert_called()
+        mock_client.files.upload.assert_not_called()
+        mock_client.models.generate_content.assert_called_once()
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_expired_file_shows_error(self, mock_get_client: MagicMock) -> None:
+        """Test that expired/missing file shows helpful error."""
+        mock_client = MagicMock()
+        mock_client.files.get.side_effect = Exception("404 Not Found")
+        mock_get_client.return_value = mock_client
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["files/expired123", "--api-key", "fake-key"],
+        )
+
+        assert result.exit_code != 0
+        assert (
+            "expired" in result.output.lower() or "not found" in result.output.lower()
+        )
+
+
+class TestGetSafeFilenameFilesApi:
+    """Tests for get_safe_filename with Files API references."""
+
+    def test_files_ref_generates_safe_name(self) -> None:
+        """Test that files/ references produce valid filenames."""
+        result = get_safe_filename("files/abc123")
+        assert result == "files_abc123"
+        assert "/" not in result

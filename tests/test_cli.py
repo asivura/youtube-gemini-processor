@@ -11,11 +11,14 @@ import pytest
 from click.testing import CliRunner
 
 from youtube_gemini_processor.cli import (
+    MEDIA_RESOLUTION_MAP,
     PROMPTS,
     SEGMENTS_SCHEMA,
     VIDEO_MIME_TYPES,
     VideoAnalysis,
     _sanitize_filename,
+    build_generate_config,
+    build_video_part,
     calculate_cost,
     extract_video_id,
     format_output_json,
@@ -29,7 +32,9 @@ from youtube_gemini_processor.cli import (
     is_youtube_url,
     main,
     normalize_files_api_ref,
+    parse_clip_range,
     parse_segments,
+    parse_timestamp_to_seconds,
     process_files_api_ref,
     split_video,
     validate_youtube_url,
@@ -1425,3 +1430,346 @@ class TestGetSafeFilenameFilesApi:
         result = get_safe_filename("files/abc123")
         assert result == "files_abc123"
         assert "/" not in result
+
+
+class TestParseTimestampToSeconds:
+    """Tests for parse_timestamp_to_seconds function."""
+
+    def test_raw_seconds_with_suffix(self) -> None:
+        assert parse_timestamp_to_seconds("123s") == "123s"
+
+    def test_raw_seconds_digits_only(self) -> None:
+        assert parse_timestamp_to_seconds("90") == "90s"
+
+    def test_mm_ss_format(self) -> None:
+        assert parse_timestamp_to_seconds("1:30") == "90s"
+
+    def test_hh_mm_ss_format(self) -> None:
+        assert parse_timestamp_to_seconds("1:05:30") == "3930s"
+
+    def test_zero_timestamp(self) -> None:
+        assert parse_timestamp_to_seconds("0") == "0s"
+
+    def test_zero_mm_ss(self) -> None:
+        assert parse_timestamp_to_seconds("0:00") == "0s"
+
+    def test_whitespace_stripped(self) -> None:
+        assert parse_timestamp_to_seconds("  90  ") == "90s"
+
+    def test_invalid_format_raises_error(self) -> None:
+        with pytest.raises(click.ClickException, match="Invalid timestamp format"):
+            parse_timestamp_to_seconds("abc")
+
+    def test_invalid_colon_format_raises_error(self) -> None:
+        with pytest.raises(click.ClickException, match="Invalid timestamp format"):
+            parse_timestamp_to_seconds("a:b:c")
+
+
+class TestParseClipRange:
+    """Tests for parse_clip_range function."""
+
+    def test_simple_seconds(self) -> None:
+        start, end = parse_clip_range("90-300")
+        assert start == "90s"
+        assert end == "300s"
+
+    def test_mm_ss_format(self) -> None:
+        start, end = parse_clip_range("1:30-5:00")
+        assert start == "90s"
+        assert end == "300s"
+
+    def test_seconds_with_suffix(self) -> None:
+        start, end = parse_clip_range("90s-300s")
+        assert start == "90s"
+        assert end == "300s"
+
+    def test_no_hyphen_raises_error(self) -> None:
+        with pytest.raises(click.ClickException, match="Invalid clip format"):
+            parse_clip_range("12345")
+
+    def test_zero_start(self) -> None:
+        start, end = parse_clip_range("0-60")
+        assert start == "0s"
+        assert end == "60s"
+
+
+class TestBuildVideoPart:
+    """Tests for build_video_part function."""
+
+    @patch("google.genai.types")
+    def test_basic_part_no_metadata(self, mock_types: MagicMock) -> None:
+        """Test building a part with no video metadata."""
+        build_video_part("https://example.com/video", "video/mp4")
+
+        mock_types.FileData.assert_called_once_with(
+            file_uri="https://example.com/video", mime_type="video/mp4"
+        )
+        mock_types.Part.assert_called_once()
+        # Should NOT have video_metadata
+        call_kwargs = mock_types.Part.call_args[1]
+        assert "video_metadata" not in call_kwargs
+
+    @patch("google.genai.types")
+    def test_part_with_fps(self, mock_types: MagicMock) -> None:
+        """Test building a part with custom FPS."""
+        build_video_part("https://example.com/video", "video/mp4", fps=2.0)
+
+        mock_types.VideoMetadata.assert_called_once_with(fps=2.0)
+        call_kwargs = mock_types.Part.call_args[1]
+        assert "video_metadata" in call_kwargs
+
+    @patch("google.genai.types")
+    def test_part_with_clip(self, mock_types: MagicMock) -> None:
+        """Test building a part with clip offsets."""
+        build_video_part(
+            "https://example.com/video",
+            "video/mp4",
+            clip_start="90s",
+            clip_end="300s",
+        )
+
+        mock_types.VideoMetadata.assert_called_once_with(
+            start_offset="90s", end_offset="300s"
+        )
+
+    @patch("google.genai.types")
+    def test_part_with_all_options(self, mock_types: MagicMock) -> None:
+        """Test building a part with all video metadata options."""
+        build_video_part(
+            "https://example.com/video",
+            "video/mp4",
+            fps=0.5,
+            clip_start="0s",
+            clip_end="600s",
+        )
+
+        mock_types.VideoMetadata.assert_called_once_with(
+            fps=0.5, start_offset="0s", end_offset="600s"
+        )
+
+
+class TestBuildGenerateConfig:
+    """Tests for build_generate_config function."""
+
+    @patch("google.genai.types")
+    @patch("youtube_gemini_processor.cli.get_max_output_tokens", return_value=8192)
+    def test_basic_config(self, mock_tokens: MagicMock, mock_types: MagicMock) -> None:
+        """Test basic config without media resolution."""
+        build_generate_config("gemini-2.5-flash")
+
+        call_kwargs = mock_types.GenerateContentConfig.call_args[1]
+        assert call_kwargs["max_output_tokens"] == 8192
+        assert "media_resolution" not in call_kwargs
+
+    @patch("google.genai.types")
+    @patch("youtube_gemini_processor.cli.get_max_output_tokens", return_value=8192)
+    def test_config_with_media_resolution(
+        self, mock_tokens: MagicMock, mock_types: MagicMock
+    ) -> None:
+        """Test config with media resolution."""
+        build_generate_config(
+            "gemini-2.5-flash", media_resolution="MEDIA_RESOLUTION_LOW"
+        )
+
+        call_kwargs = mock_types.GenerateContentConfig.call_args[1]
+        assert call_kwargs["media_resolution"] == "MEDIA_RESOLUTION_LOW"
+
+    @patch("google.genai.types")
+    @patch("youtube_gemini_processor.cli.get_max_output_tokens", return_value=8192)
+    def test_config_with_response_schema(
+        self, mock_tokens: MagicMock, mock_types: MagicMock
+    ) -> None:
+        """Test config with response schema."""
+        schema = {"type": "object"}
+        build_generate_config("gemini-2.5-flash", response_schema=schema)
+
+        call_kwargs = mock_types.GenerateContentConfig.call_args[1]
+        assert call_kwargs["response_mime_type"] == "application/json"
+        assert call_kwargs["response_schema"] == schema
+
+
+class TestMediaResolutionMap:
+    """Tests for MEDIA_RESOLUTION_MAP constant."""
+
+    def test_low_maps_correctly(self) -> None:
+        assert MEDIA_RESOLUTION_MAP["low"] == "MEDIA_RESOLUTION_LOW"
+
+    def test_medium_maps_correctly(self) -> None:
+        assert MEDIA_RESOLUTION_MAP["medium"] == "MEDIA_RESOLUTION_MEDIUM"
+
+    def test_high_maps_correctly(self) -> None:
+        assert MEDIA_RESOLUTION_MAP["high"] == "MEDIA_RESOLUTION_HIGH"
+
+    def test_all_keys_present(self) -> None:
+        assert set(MEDIA_RESOLUTION_MAP.keys()) == {"low", "medium", "high"}
+
+
+class TestCLIVideoProcessingOptions:
+    """Tests for --fps, --clip, and --media-resolution CLI options."""
+
+    def test_fps_option_in_help(self) -> None:
+        """Test that --fps option appears in help output."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["--help"])
+        assert "--fps" in result.output
+        assert "frame sampling rate" in result.output.lower()
+
+    def test_clip_option_in_help(self) -> None:
+        """Test that --clip option appears in help output."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["--help"])
+        assert "--clip" in result.output
+
+    def test_media_resolution_option_in_help(self) -> None:
+        """Test that --media-resolution option appears in help output."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["--help"])
+        assert "--media-resolution" in result.output
+        assert "low" in result.output
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_fps_passed_to_process_video(self, mock_get_client: MagicMock) -> None:
+        """Test that --fps value is passed through to process function."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.text = "# Analysis\nTest content"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "https://www.youtube.com/watch?v=test123",
+                "--api-key",
+                "fake-key",
+                "--fps",
+                "2.0",
+            ],
+        )
+
+        assert result.exit_code == 0
+        # Verify generate_content was called
+        mock_client.models.generate_content.assert_called_once()
+        # The video_metadata with fps should have been set
+        call_kwargs = mock_client.models.generate_content.call_args
+        contents = call_kwargs[1]["contents"]
+        video_part = contents[0].parts[0]
+        assert video_part.video_metadata is not None
+        assert video_part.video_metadata.fps == 2.0
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_clip_passed_to_process_video(self, mock_get_client: MagicMock) -> None:
+        """Test that --clip value is parsed and passed through."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.text = "# Analysis\nTest content"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "https://www.youtube.com/watch?v=test123",
+                "--api-key",
+                "fake-key",
+                "--clip",
+                "1:30-5:00",
+            ],
+        )
+
+        assert result.exit_code == 0
+        mock_client.models.generate_content.assert_called_once()
+        call_kwargs = mock_client.models.generate_content.call_args
+        contents = call_kwargs[1]["contents"]
+        video_part = contents[0].parts[0]
+        assert video_part.video_metadata is not None
+        assert video_part.video_metadata.start_offset == "90s"
+        assert video_part.video_metadata.end_offset == "300s"
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_media_resolution_passed_to_config(
+        self, mock_get_client: MagicMock
+    ) -> None:
+        """Test that --media-resolution value is mapped and passed to config."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.text = "# Analysis\nTest content"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "https://www.youtube.com/watch?v=test123",
+                "--api-key",
+                "fake-key",
+                "--media-resolution",
+                "low",
+            ],
+        )
+
+        assert result.exit_code == 0
+        mock_client.models.generate_content.assert_called_once()
+        call_kwargs = mock_client.models.generate_content.call_args
+        config = call_kwargs[1]["config"]
+        assert config.media_resolution == "MEDIA_RESOLUTION_LOW"
+
+    def test_invalid_media_resolution_rejected(self) -> None:
+        """Test that invalid media resolution values are rejected by Click."""
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "https://www.youtube.com/watch?v=test123",
+                "--api-key",
+                "fake-key",
+                "--media-resolution",
+                "ultra",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert (
+            "Invalid value" in result.output
+            or "invalid choice" in result.output.lower()
+        )
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_no_video_options_no_metadata(self, mock_get_client: MagicMock) -> None:
+        """Test that omitting video options doesn't add VideoMetadata."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.text = "# Analysis\nTest content"
+        mock_response.usage_metadata = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "https://www.youtube.com/watch?v=test123",
+                "--api-key",
+                "fake-key",
+            ],
+        )
+
+        assert result.exit_code == 0
+        call_kwargs = mock_client.models.generate_content.call_args
+        contents = call_kwargs[1]["contents"]
+        video_part = contents[0].parts[0]
+        # video_metadata should not be set when no options provided
+        assert (
+            not hasattr(video_part, "video_metadata")
+            or video_part.video_metadata is None
+        )

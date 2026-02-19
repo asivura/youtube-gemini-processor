@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -501,6 +502,152 @@ def is_youtube_url(url: str) -> bool:
     return any(re.search(pattern, url) for pattern in youtube_patterns)
 
 
+def parse_timestamp_to_seconds(timestamp: str) -> str:
+    """Parse a timestamp string to seconds format for the API.
+
+    Accepts formats:
+        - "123s" or "123" (raw seconds)
+        - "MM:SS" (e.g., "5:30")
+        - "HH:MM:SS" (e.g., "1:05:30")
+
+    Returns:
+        String in "{seconds}s" format (e.g., "330s").
+    """
+    timestamp = timestamp.strip()
+
+    # Already in seconds format
+    if timestamp.endswith("s"):
+        return timestamp
+    if timestamp.isdigit():
+        return f"{timestamp}s"
+
+    parts = timestamp.split(":")
+    try:
+        if len(parts) == 2:  # noqa: PLR2004
+            minutes, seconds = int(parts[0]), int(parts[1])
+            return f"{minutes * 60 + seconds}s"
+        if len(parts) == 3:  # noqa: PLR2004
+            hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
+            return f"{hours * 3600 + minutes * 60 + seconds}s"
+    except ValueError:
+        pass
+
+    raise click.ClickException(
+        f"Invalid timestamp format: {timestamp}\n"
+        "Expected: SS, MM:SS, or HH:MM:SS (e.g., 90, 1:30, 0:01:30)"
+    )
+
+
+def parse_clip_range(clip: str) -> tuple[str, str]:
+    """Parse a clip range string into start and end offsets.
+
+    Accepts format: "START-END" where START and END are timestamps.
+    Examples: "1:30-5:00", "0:01:30-0:05:00", "90-300", "90s-300s"
+
+    Returns:
+        Tuple of (start_offset, end_offset) in "{seconds}s" format.
+    """
+    if "-" not in clip:
+        raise click.ClickException(
+            f"Invalid clip format: {clip}\n"
+            "Expected: START-END (e.g., 1:30-5:00 or 90-300)"
+        )
+
+    # Split on last hyphen to handle negative edge cases
+    # But timestamps don't have negatives, so split on first hyphen
+    # that separates two timestamp parts
+    # Handle HH:MM:SS-HH:MM:SS by finding the separator hyphen
+    # A separator hyphen is one that's NOT preceded by a colon
+    parts = clip.split("-")
+    if len(parts) == 2:  # noqa: PLR2004
+        start_str, end_str = parts
+    elif len(parts) > 2:  # noqa: PLR2004
+        # Could be HH:MM:SS-HH:MM:SS which has no extra hyphens,
+        # or raw seconds like 90-300. Try first hyphen after pos 0.
+        dash_idx = clip.find("-", 1)
+        start_str = clip[:dash_idx]
+        end_str = clip[dash_idx + 1 :]
+    else:
+        raise click.ClickException(
+            f"Invalid clip format: {clip}\n"
+            "Expected: START-END (e.g., 1:30-5:00 or 90-300)"
+        )
+
+    return parse_timestamp_to_seconds(start_str), parse_timestamp_to_seconds(end_str)
+
+
+MEDIA_RESOLUTION_MAP = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
+}
+
+
+def build_video_part(
+    file_uri: str,
+    mime_type: str,
+    *,
+    fps: float | None = None,
+    clip_start: str | None = None,
+    clip_end: str | None = None,
+):
+    """Build a video Part with optional VideoMetadata.
+
+    Args:
+        file_uri: The file URI (Files API, GCS, or YouTube URL).
+        mime_type: MIME type of the video.
+        fps: Custom frames per second for sampling.
+        clip_start: Start offset in "{seconds}s" format.
+        clip_end: End offset in "{seconds}s" format.
+    """
+    from google.genai import types
+
+    part_kwargs: dict = {
+        "file_data": types.FileData(file_uri=file_uri, mime_type=mime_type),
+    }
+
+    # Add video metadata if any processing options are set
+    vm_kwargs: dict = {}
+    if fps is not None:
+        vm_kwargs["fps"] = fps
+    if clip_start is not None:
+        vm_kwargs["start_offset"] = clip_start
+    if clip_end is not None:
+        vm_kwargs["end_offset"] = clip_end
+
+    if vm_kwargs:
+        part_kwargs["video_metadata"] = types.VideoMetadata(**vm_kwargs)
+
+    return types.Part(**part_kwargs)
+
+
+def build_generate_config(
+    model: str,
+    *,
+    response_schema: dict | None = None,
+    media_resolution: str | None = None,
+):
+    """Build a GenerateContentConfig with optional media resolution.
+
+    Args:
+        model: Model name (used to determine max output tokens).
+        response_schema: Optional JSON schema for structured output.
+        media_resolution: One of "low", "medium", "high", or None.
+    """
+    from google.genai import types
+
+    config_kwargs: dict = {
+        "max_output_tokens": get_max_output_tokens(model),
+    }
+    if response_schema:
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = response_schema
+    if media_resolution:
+        config_kwargs["media_resolution"] = media_resolution
+
+    return types.GenerateContentConfig(**config_kwargs)
+
+
 def is_gcs_uri(uri: str) -> bool:
     """Check if input is a Google Cloud Storage URI."""
     return uri.startswith("gs://")
@@ -573,6 +720,64 @@ def get_video_duration(file_path: str) -> str | None:
         return None
 
 
+def get_video_duration_gcs(gcs_uri: str) -> str | None:
+    """Get video duration from a GCS URI using ffprobe with authenticated HTTPS.
+
+    Converts gs://bucket/path to an HTTPS URL and uses an OAuth2 access token
+    for authentication. ffprobe only reads the file header, not the full file.
+
+    Returns None if ffprobe is not available, auth fails, or probing fails.
+    """
+    if not shutil.which("ffprobe"):
+        return None
+
+    match = re.match(r"gs://([^/]+)/(.+)", gcs_uri)
+    if not match:
+        return None
+
+    bucket, path = match.groups()
+    https_url = (
+        f"https://storage.googleapis.com/{bucket}/{urllib.parse.quote(path, safe='/')}"
+    )
+
+    try:
+        import google.auth
+        import google.auth.transport.requests
+
+        credentials, _ = google.auth.default()
+        credentials.refresh(google.auth.transport.requests.Request())
+        token = credentials.token
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-headers",
+                f"Authorization: Bearer {token}\r\n",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                https_url,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        seconds = float(result.stdout.strip())
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    except (ValueError, OSError):
+        return None
+
+
 def get_video_mime_type(file_path: Path) -> str:
     """Get MIME type for a video file based on extension."""
     ext = file_path.suffix.lower()
@@ -592,6 +797,10 @@ def process_local_file(
     model: str = "gemini-3-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
+    fps: float | None = None,
+    clip_start: str | None = None,
+    clip_end: str | None = None,
+    media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a local video file with Gemini API using Files API."""
     from google.genai import types
@@ -631,32 +840,29 @@ def process_local_file(
         if uploaded_file.state.name == "FAILED":
             raise click.ClickException(f"File processing failed: {uploaded_file.name}")
 
-        # Build config
-        config_kwargs: dict = {
-            "max_output_tokens": get_max_output_tokens(model),
-        }
-        if response_schema:
-            config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_schema
-
         # Generate content using the uploaded file
+        video_part = build_video_part(
+            uploaded_file.uri,
+            mime_type,
+            fps=fps,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        config = build_generate_config(
+            model,
+            response_schema=response_schema,
+            media_resolution=media_resolution,
+        )
+
         response = client.models.generate_content(
             model=model,
             contents=[
                 types.Content(
                     role="user",
-                    parts=[
-                        types.Part(
-                            file_data=types.FileData(
-                                file_uri=uploaded_file.uri,
-                                mime_type=mime_type,
-                            )
-                        ),
-                        types.Part(text=prompt),
-                    ],
+                    parts=[video_part, types.Part(text=prompt)],
                 )
             ],
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=config,
         )
 
         analysis.raw_response = response.text
@@ -701,6 +907,10 @@ def process_files_api_ref(
     model: str = "gemini-3-flash-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
+    fps: float | None = None,
+    clip_start: str | None = None,
+    clip_end: str | None = None,
+    media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a video using an existing Files API reference.
 
@@ -748,31 +958,28 @@ def process_files_api_ref(
         if verbose:
             click.echo(f"  Using file: {file_info.name} ({mime_type})", err=True)
 
-        # Build config
-        config_kwargs: dict = {
-            "max_output_tokens": get_max_output_tokens(model),
-        }
-        if response_schema:
-            config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_schema
+        video_part = build_video_part(
+            file_info.uri,
+            mime_type,
+            fps=fps,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        config = build_generate_config(
+            model,
+            response_schema=response_schema,
+            media_resolution=media_resolution,
+        )
 
         response = client.models.generate_content(
             model=model,
             contents=[
                 types.Content(
                     role="user",
-                    parts=[
-                        types.Part(
-                            file_data=types.FileData(
-                                file_uri=file_info.uri,
-                                mime_type=mime_type,
-                            )
-                        ),
-                        types.Part(text=prompt),
-                    ],
+                    parts=[video_part, types.Part(text=prompt)],
                 )
             ],
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=config,
         )
 
         analysis.raw_response = response.text
@@ -820,6 +1027,10 @@ def process_gcs_uri(
     model: str = "gemini-3-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
+    fps: float | None = None,
+    clip_start: str | None = None,
+    clip_end: str | None = None,
+    media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a video from Google Cloud Storage with Gemini API."""
     from google.genai import types
@@ -841,31 +1052,28 @@ def process_gcs_uri(
         if verbose:
             click.echo(f"  Processing GCS file: {filename}", err=True)
 
-        # Build config
-        config_kwargs: dict = {
-            "max_output_tokens": get_max_output_tokens(model),
-        }
-        if response_schema:
-            config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_schema
+        video_part = build_video_part(
+            gcs_uri,
+            mime_type,
+            fps=fps,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        config = build_generate_config(
+            model,
+            response_schema=response_schema,
+            media_resolution=media_resolution,
+        )
 
         response = client.models.generate_content(
             model=model,
             contents=[
                 types.Content(
                     role="user",
-                    parts=[
-                        types.Part(
-                            file_data=types.FileData(
-                                file_uri=gcs_uri,
-                                mime_type=mime_type,
-                            )
-                        ),
-                        types.Part(text=prompt),
-                    ],
+                    parts=[video_part, types.Part(text=prompt)],
                 )
             ],
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=config,
         )
 
         analysis.raw_response = response.text
@@ -909,6 +1117,10 @@ def process_video(
     prompt: str,
     model: str = "gemini-3-pro-preview",
     response_schema: dict | None = None,
+    fps: float | None = None,
+    clip_start: str | None = None,
+    clip_end: str | None = None,
+    media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a single YouTube video with Gemini API."""
     from google.genai import types
@@ -922,31 +1134,28 @@ def process_video(
     )
 
     try:
-        # Build config
-        config_kwargs: dict = {
-            "max_output_tokens": get_max_output_tokens(model),
-        }
-        if response_schema:
-            config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_schema
+        video_part = build_video_part(
+            normalized_url,
+            "video/mp4",
+            fps=fps,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        config = build_generate_config(
+            model,
+            response_schema=response_schema,
+            media_resolution=media_resolution,
+        )
 
         response = client.models.generate_content(
             model=model,
             contents=[
                 types.Content(
                     role="user",
-                    parts=[
-                        types.Part(
-                            file_data=types.FileData(
-                                file_uri=normalized_url,
-                                mime_type="video/mp4",  # Required for Vertex AI
-                            )
-                        ),
-                        types.Part(text=prompt),
-                    ],
+                    parts=[video_part, types.Part(text=prompt)],
                 )
             ],
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=config,
         )
 
         analysis.raw_response = response.text
@@ -1358,6 +1567,27 @@ def get_safe_filename(input_source: str) -> str:
     default=None,
     help="Delete a Files API reference (e.g. files/abc123)",
 )
+@click.option(
+    "--fps",
+    type=float,
+    default=None,
+    help="Custom frame sampling rate (frames per second). Default: Gemini uses 1 FPS. "
+    "Higher values capture more detail but increase token usage.",
+)
+@click.option(
+    "--clip",
+    type=str,
+    default=None,
+    help="Process only a clip of the video. Format: START-END "
+    "(e.g., 1:30-5:00, 0:01:30-0:05:00, 90-300).",
+)
+@click.option(
+    "--media-resolution",
+    type=click.Choice(["low", "medium", "high"], case_sensitive=False),
+    default=None,
+    help="Video resolution for processing. 'low' uses ~66 tokens/frame, "
+    "'high' uses ~258 tokens/frame (default). Lower saves tokens for long videos.",
+)
 @click.version_option()
 def main(
     input: str | None,
@@ -1376,6 +1606,9 @@ def main(
     upload_only: bool,
     list_files: bool,
     delete_file: str | None,
+    fps: float | None,
+    clip: str | None,
+    media_resolution: str | None,
 ):
     """
     Process videos using Google's Gemini API.
@@ -1429,6 +1662,20 @@ def main(
         yt-process --delete-file files/abc123
 
     \b
+    Video Processing Options:
+        # Sample at 2 FPS (more detail, more tokens)
+        yt-process ./video.mp4 --fps 2
+
+        # Process only a clip (1:30 to 5:00)
+        yt-process ./video.mp4 --clip 1:30-5:00
+
+        # Use low resolution (saves tokens for long videos)
+        yt-process ./video.mp4 --media-resolution low
+
+        # Combine options
+        yt-process files/abc123 --clip 0:00-10:00 --fps 0.5 --media-resolution low
+
+    \b
     Supported Video Formats:
         .mp4, .mpeg, .mov, .avi, .webm, .wmv, .flv, .mkv, .3gp
 
@@ -1456,6 +1703,16 @@ def main(
             location = "global"
         else:
             location = "us-central1"
+
+    # Parse video processing options
+    clip_start: str | None = None
+    clip_end: str | None = None
+    if clip:
+        clip_start, clip_end = parse_clip_range(clip)
+
+    resolved_media_resolution: str | None = None
+    if media_resolution:
+        resolved_media_resolution = MEDIA_RESOLUTION_MAP[media_resolution]
 
     # Handle file management operations (no INPUT required)
     if list_files or delete_file:
@@ -1516,7 +1773,6 @@ def main(
                 "--upload-only requires a local file path as input"
             )
         import time
-
 
         path = Path(input).resolve()
         mime_type = get_video_mime_type(path)
@@ -1596,8 +1852,13 @@ def main(
 
             # For segments mode, detect video duration and inject into prompt
             video_prompt = analysis_prompt
-            if is_segments_mode and is_local_file(video_input):
-                duration = get_video_duration(video_input)
+            if is_segments_mode:
+                duration = None
+                if is_local_file(video_input):
+                    duration = get_video_duration(video_input)
+                elif is_gcs_uri(video_input):
+                    duration = get_video_duration_gcs(video_input)
+
                 if duration:
                     duration_line = (
                         f"\nThe video is exactly {duration} long. "
@@ -1608,25 +1869,54 @@ def main(
                 else:
                     duration_line = ""
                 video_prompt = analysis_prompt.format(duration_line=duration_line)
-            elif is_segments_mode:
-                video_prompt = analysis_prompt.format(duration_line="")
 
             # Detect input type and process accordingly
+            # Common video processing kwargs
+            video_kwargs = {
+                "fps": fps,
+                "clip_start": clip_start,
+                "clip_end": clip_end,
+                "media_resolution": resolved_media_resolution,
+            }
+
             if is_local_file(video_input):
                 analysis = process_local_file(
-                    client, video_input, video_prompt, model, verbose, schema
+                    client,
+                    video_input,
+                    video_prompt,
+                    model,
+                    verbose,
+                    schema,
+                    **video_kwargs,
                 )
             elif is_files_api_ref(video_input):
                 analysis = process_files_api_ref(
-                    client, video_input, video_prompt, model, verbose, schema
+                    client,
+                    video_input,
+                    video_prompt,
+                    model,
+                    verbose,
+                    schema,
+                    **video_kwargs,
                 )
             elif is_gcs_uri(video_input):
                 analysis = process_gcs_uri(
-                    client, video_input, video_prompt, model, verbose, schema
+                    client,
+                    video_input,
+                    video_prompt,
+                    model,
+                    verbose,
+                    schema,
+                    **video_kwargs,
                 )
             else:
                 analysis = process_video(
-                    client, video_input, video_prompt, model, schema
+                    client,
+                    video_input,
+                    video_prompt,
+                    model,
+                    schema,
+                    **video_kwargs,
                 )
             results.append(analysis)
 

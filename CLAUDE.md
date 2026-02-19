@@ -44,6 +44,10 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 | `process_video()` | Process YouTube videos via URL |
 | `process_local_file()` | Process local files via Files API upload |
 | `process_files_api_ref()` | Process using existing Files API reference (no upload) |
+| `parse_timestamp_to_seconds()` | Parse SS, MM:SS, HH:MM:SS to `"{seconds}s"` |
+| `parse_clip_range()` | Parse `"START-END"` clip range string |
+| `build_video_part()` | Build video Part with optional VideoMetadata (fps, clip) |
+| `build_generate_config()` | Build GenerateContentConfig with optional media resolution |
 | `calculate_cost()` | Token usage cost calculation with model pricing |
 | `format_output_*()` | Output formatters (markdown, json) |
 
@@ -85,6 +89,73 @@ For Vertex AI processing (when `GOOGLE_GENAI_USE_VERTEXAI=true`), local files mu
 gcloud storage cp "./video.mp4" gs://your-bucket/
 uv run yt-process "gs://your-bucket/video.mp4" \
   -v --vertex --project your-gcp-project
+```
+
+## Video Processing Options
+
+Control how Gemini processes video frames using `--fps`, `--clip`, and `--media-resolution`. These options work with all input types (local files, Files API refs, GCS URIs, YouTube URLs).
+
+### Frame Rate (`--fps`)
+
+Override Gemini's default 1 FPS frame sampling. Higher values capture more detail but increase token usage.
+
+```bash
+# Sample at 2 FPS (more visual detail)
+yt-process ./video.mp4 --fps 2
+
+# Sample at 0.5 FPS (fewer frames, lower cost)
+yt-process ./video.mp4 --fps 0.5
+
+# Works with Files API references too
+yt-process files/abc123 --fps 2
+```
+
+**Token impact**: Default 1 FPS = ~300 tokens/sec. Higher FPS increases proportionally.
+
+### Clip (`--clip`)
+
+Process only a portion of the video. Accepts `START-END` in multiple timestamp formats.
+
+```bash
+# Process 1:30 to 5:00 (MM:SS format)
+yt-process ./video.mp4 --clip 1:30-5:00
+
+# Raw seconds
+yt-process ./video.mp4 --clip 90-300
+
+# HH:MM:SS format
+yt-process ./video.mp4 --clip 0:01:30-0:05:00
+
+# With seconds suffix
+yt-process ./video.mp4 --clip 90s-300s
+```
+
+### Media Resolution (`--media-resolution`)
+
+Control the resolution at which video frames are processed. Lower resolution saves tokens for long videos.
+
+| Value | Tokens/Frame | Use Case |
+|-------|-------------|----------|
+| `low` | ~66 | Long videos, cost optimization |
+| `medium` | (intermediate) | Balanced |
+| `high` | ~258 (default) | Detailed visual analysis |
+
+```bash
+# Low resolution for a long lecture
+yt-process ./video.mp4 --media-resolution low
+
+# High resolution for detailed visual inspection
+yt-process ./video.mp4 --media-resolution high
+```
+
+### Combining Options
+
+```bash
+# Analyze a specific clip at low resolution with custom FPS
+yt-process files/abc123 --clip 0:00-10:00 --fps 0.5 --media-resolution low
+
+# Detailed analysis of a short segment
+yt-process ./video.mp4 --clip 5:00-5:30 --fps 5 --media-resolution high
 ```
 
 ## Analysis Modes

@@ -76,7 +76,7 @@ Vertex AI uses Google Cloud Application Default Credentials (ADC). This is usefu
 gcloud auth application-default login
 
 # 3. Set your GCP project (pick one method)
-export GOOGLE_CLOUD_PROJECT="your-gcp-project"
+export YT_PROCESS_PROJECT="your-gcp-project"
 # or pass it via --project flag
 ```
 
@@ -88,7 +88,7 @@ yt-process "./video.mp4" --vertex --project your-gcp-project
 
 # Or set the environment variable to auto-enable Vertex AI
 export GOOGLE_GENAI_USE_VERTEXAI=true
-export GOOGLE_CLOUD_PROJECT="your-gcp-project"
+export YT_PROCESS_PROJECT="your-gcp-project"
 yt-process "./video.mp4"
 ```
 
@@ -96,7 +96,8 @@ yt-process "./video.mp4"
 
 | Variable | Description |
 |----------|-------------|
-| `GOOGLE_CLOUD_PROJECT` | GCP project ID (required) |
+| `YT_PROCESS_PROJECT` | GCP project ID (preferred, tool-specific) |
+| `GOOGLE_CLOUD_PROJECT` | GCP project ID (fallback) |
 | `GOOGLE_CLOUD_LOCATION` | GCP region (default: `global` for gemini-3-* models, `us-central1` for others) |
 | `GOOGLE_GENAI_USE_VERTEXAI` | Set to `true` to auto-enable Vertex AI without `--vertex` flag |
 

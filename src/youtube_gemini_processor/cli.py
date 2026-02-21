@@ -406,6 +406,7 @@ def get_gemini_client(
         # Requires: gcloud auth application-default login
         gcp_project = (
             project
+            or os.environ.get("YT_PROCESS_PROJECT")
             or os.environ.get("GOOGLE_CLOUD_PROJECT")
             or os.environ.get("GCP_PROJECT")
             or os.environ.get("CLOUDSDK_CORE_PROJECT")
@@ -419,7 +420,7 @@ def get_gemini_client(
 
         if not gcp_project:
             raise click.ClickException(
-                "Vertex AI requires a GCP project. Set GOOGLE_CLOUD_PROJECT "
+                "Vertex AI requires a GCP project. Set YT_PROCESS_PROJECT "
                 "environment variable or pass --project"
             )
 
@@ -1532,7 +1533,7 @@ def get_safe_filename(input_source: str) -> str:
 @click.option(
     "--project",
     type=str,
-    help="GCP project for Vertex AI (or set GOOGLE_CLOUD_PROJECT)",
+    help="GCP project for Vertex AI (or set YT_PROCESS_PROJECT)",
 )
 @click.option(
     "--location",
@@ -1693,7 +1694,8 @@ def main(
     Environment Variables:
         GEMINI_API_KEY           Google Gemini API key
         GOOGLE_API_KEY           Alternative API key variable
-        GOOGLE_CLOUD_PROJECT     GCP project for Vertex AI
+        YT_PROCESS_PROJECT       GCP project for Vertex AI (tool-specific)
+        GOOGLE_CLOUD_PROJECT     GCP project for Vertex AI (fallback)
         GOOGLE_CLOUD_LOCATION    GCP location (default: us-central1)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
     """

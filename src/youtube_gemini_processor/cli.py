@@ -473,6 +473,94 @@ def extract_video_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def fetch_youtube_chapters(url: str) -> list[dict]:
+    """Fetch chapter timestamps from a YouTube video description.
+
+    Scrapes the YouTube page and extracts chapter markers from the description.
+    Chapters are timestamps in the format "(HH:MM:SS) Title" or "(MM:SS) Title".
+
+    Returns:
+        List of segment dicts with segment_number, start_time, end_time, title.
+        Empty list if no chapters found.
+    """
+    import urllib.request
+
+    video_id = extract_video_id(url)
+    if not video_id:
+        return []
+
+    fetch_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        req = urllib.request.Request(
+            fetch_url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    # Extract description from page data
+    description = ""
+    for pattern in [
+        r'"shortDescription":"(.*?)"',
+        r'"description":\{"simpleText":"(.*?)"\}',
+    ]:
+        match = re.search(pattern, html)
+        if match:
+            description = match.group(1).encode().decode("unicode_escape")
+            break
+
+    if not description:
+        return []
+
+    # Parse chapter timestamps from description
+    # Matches patterns like: (00:00) Title, 0:00 Title, 00:00:00 Title
+    chapter_pattern = re.compile(
+        r"^\(?(\d{1,2}:\d{2}(?::\d{2})?)\)?\s+(.+)$", re.MULTILINE
+    )
+    matches = list(chapter_pattern.finditer(description))
+
+    if len(matches) < 2:
+        return []
+
+    chapters = []
+    for i, m in enumerate(matches):
+        start_time = m.group(1)
+        title = m.group(2).strip()
+
+        # Normalize to HH:MM:SS
+        parts = start_time.split(":")
+        if len(parts) == 2:
+            start_time = f"00:{parts[0].zfill(2)}:{parts[1]}"
+        elif len(parts) == 3:
+            start_time = f"{parts[0].zfill(2)}:{parts[1]}:{parts[2]}"
+
+        # End time is start of next chapter, or empty for last
+        if i + 1 < len(matches):
+            end_time = matches[i + 1].group(1)
+            end_parts = end_time.split(":")
+            if len(end_parts) == 2:
+                end_time = f"00:{end_parts[0].zfill(2)}:{end_parts[1]}"
+            elif len(end_parts) == 3:
+                end_time = f"{end_parts[0].zfill(2)}:{end_parts[1]}:{end_parts[2]}"
+        else:
+            end_time = ""
+
+        chapters.append(
+            {
+                "segment_number": i + 1,
+                "start_time": start_time,
+                "end_time": end_time,
+                "title": title,
+                "speaker": "",
+                "summary": "",
+            }
+        )
+
+    return chapters
+
+
 # Supported video MIME types
 VIDEO_MIME_TYPES = {
     ".mp4": "video/mp4",
@@ -1392,6 +1480,120 @@ def split_video(
     return created_files
 
 
+def split_youtube_video(
+    client,
+    url: str,
+    chapters: list[dict],
+    analysis_prompt: str,
+    model: str,
+    output_dir: Path,
+    output_format: str,
+    verbose: bool = False,
+    fps: float | None = None,
+    media_resolution: str | None = None,
+) -> list[Path]:
+    """Process a YouTube video in chunks, one per chapter.
+
+    Each chapter is processed as an independent --clip call to the Gemini API,
+    producing a separate output file per chapter.
+
+    Args:
+        client: Gemini API client.
+        url: YouTube URL.
+        chapters: List of chapter dicts with start_time, end_time, title.
+        analysis_prompt: The prompt to use for each chunk.
+        model: Model name.
+        output_dir: Directory for output files.
+        output_format: "markdown" or "json".
+        verbose: Print progress messages.
+        fps: Frame sampling rate.
+        media_resolution: Video resolution setting.
+
+    Returns:
+        List of paths to the created output files.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    formatter = format_output_json if output_format == "json" else format_output_markdown
+    extension = "json" if output_format == "json" else "md"
+    created_files = []
+    total_usage = UsageStats()
+
+    for chapter in chapters:
+        num = chapter.get("segment_number", 0)
+        title = chapter.get("title", "untitled")
+        start = chapter.get("start_time", "")
+        end = chapter.get("end_time", "")
+
+        if not start:
+            continue
+
+        # Convert timestamps to API format
+        try:
+            clip_start = parse_timestamp_to_seconds(start)
+            clip_end = parse_timestamp_to_seconds(end) if end else None
+        except click.ClickException:
+            if verbose:
+                click.echo(f"  Skipping chapter {num}: invalid timestamps", err=True)
+            continue
+
+        safe_title = _sanitize_filename(title)
+        filename = f"{num:02d}_{safe_title}.{extension}"
+        out_path = output_dir / filename
+
+        click.echo(
+            f"\n  [{num}/{len(chapters)}] {title} ({start} - {end or 'end'})",
+            err=True,
+        )
+
+        try:
+            analysis = process_video(
+                client,
+                url,
+                analysis_prompt,
+                model,
+                response_schema=None,
+                fps=fps,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                media_resolution=media_resolution,
+            )
+        except Exception as e:
+            click.echo(f"    Error: {e}", err=True)
+            continue
+
+        if analysis.error:
+            click.echo(f"    Error: {analysis.error}", err=True)
+            continue
+
+        # Accumulate usage
+        if analysis.usage:
+            total_usage.input_tokens += analysis.usage.input_tokens
+            total_usage.output_tokens += analysis.usage.output_tokens
+            total_usage.total_tokens += analysis.usage.total_tokens
+            total_usage.input_cost += analysis.usage.input_cost
+            total_usage.output_cost += analysis.usage.output_cost
+            total_usage.total_cost += analysis.usage.total_cost
+
+        formatted = formatter(analysis)
+        out_path.write_text(formatted)
+        created_files.append(out_path)
+
+        if verbose and analysis.usage:
+            click.echo(
+                f"    Saved: {filename} "
+                f"(${analysis.usage.total_cost:.4f})",
+                err=True,
+            )
+
+    click.echo(
+        f"\nProcessed {len(created_files)}/{len(chapters)} chapters. "
+        f"Total: {total_usage.total_tokens:,} tokens, ${total_usage.total_cost:.4f}",
+        err=True,
+    )
+
+    return created_files
+
+
 def format_output_markdown(analysis: VideoAnalysis) -> str:
     """Format analysis as markdown."""
     if analysis.error:
@@ -1550,7 +1752,8 @@ def get_safe_filename(input_source: str) -> str:
 @click.option(
     "--split",
     is_flag=True,
-    help="Split video into segments using ffmpeg (requires --mode segments and a local file)",
+    help="Split video into segments. Local files: uses ffmpeg (requires --mode segments). "
+    "YouTube URLs: fetches chapters and processes each chunk independently.",
 )
 @click.option(
     "--upload-only",
@@ -1754,8 +1957,8 @@ def main(
     if input and batch:
         raise click.ClickException("Cannot specify both INPUT and --batch")
 
-    if split and mode != "segments" and not prompt:
-        raise click.ClickException("--split requires --mode segments")
+    if split and input and not is_youtube_url(input) and mode != "segments" and not prompt:
+        raise click.ClickException("--split requires --mode segments for local files")
 
     if upload_only and batch:
         raise click.ClickException("--upload-only cannot be used with --batch")
@@ -1830,6 +2033,48 @@ def main(
             output_dir_path.mkdir(parents=True, exist_ok=True)
         else:
             output_file = output_path
+
+    # YouTube chunked processing: --split with YouTube URL (not segments mode)
+    if split and input and is_youtube_url(input) and not is_segments_mode:
+        click.echo("Fetching YouTube chapters...", err=True)
+        chapters = fetch_youtube_chapters(input)
+
+        if not chapters:
+            raise click.ClickException(
+                "No YouTube chapters found in video description. "
+                "Use --mode segments to detect chapters with AI, or process manually with --clip."
+            )
+
+        click.echo(f"Found {len(chapters)} chapters:", err=True)
+        for ch in chapters:
+            click.echo(
+                f"  {ch['segment_number']:2d}. [{ch['start_time']} - {ch['end_time'] or 'end'}] "
+                f"{ch['title']}",
+                err=True,
+            )
+
+        # Determine output directory
+        if output:
+            split_out = Path(output)
+        else:
+            video_id = extract_video_id(input) or "youtube"
+            split_out = Path(f"split_{video_id}")
+
+        created = split_youtube_video(
+            client=client,
+            url=input,
+            chapters=chapters,
+            analysis_prompt=analysis_prompt,
+            model=model,
+            output_dir=split_out,
+            output_format=output_format,
+            verbose=verbose,
+            fps=fps,
+            media_resolution=resolved_media_resolution,
+        )
+
+        click.echo(f"\nCreated {len(created)} chapter files in {split_out}", err=True)
+        return
 
     # Process videos
     results: list[VideoAnalysis] = []
@@ -1944,8 +2189,11 @@ def main(
                         err=True,
                     )
                 elif split and not is_local_file(video_input):
+                    # For non-local files, --split in segments mode just warns
                     click.echo(
-                        "Warning: --split only works with local video files",
+                        "Note: --split with segments mode on non-local files only "
+                        "outputs segment data. Use --split without --mode segments "
+                        "on YouTube URLs for chunked processing.",
                         err=True,
                     )
             else:

@@ -1480,6 +1480,65 @@ def split_video(
     return created_files
 
 
+def _process_single_chapter(
+    client,
+    url: str,
+    chapter: dict,
+    total_chapters: int,
+    analysis_prompt: str,
+    model: str,
+    output_dir: Path,
+    formatter,
+    extension: str,
+    verbose: bool,
+    fps: float | None,
+    media_resolution: str | None,
+) -> tuple[Path | None, UsageStats | None, str]:
+    """Process a single chapter clip. Returns (output_path, usage, status_msg)."""
+    num = chapter.get("segment_number", 0)
+    title = chapter.get("title", "untitled")
+    start = chapter.get("start_time", "")
+    end = chapter.get("end_time", "")
+
+    if not start:
+        return None, None, f"  [{num}/{total_chapters}] Skipped: no start time"
+
+    try:
+        clip_start = parse_timestamp_to_seconds(start)
+        clip_end = parse_timestamp_to_seconds(end) if end else None
+    except click.ClickException:
+        return None, None, f"  [{num}/{total_chapters}] Skipped: invalid timestamps"
+
+    safe_title = _sanitize_filename(title)
+    filename = f"{num:02d}_{safe_title}.{extension}"
+    out_path = output_dir / filename
+
+    try:
+        analysis = process_video(
+            client,
+            url,
+            analysis_prompt,
+            model,
+            response_schema=None,
+            fps=fps,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            media_resolution=media_resolution,
+        )
+    except Exception as e:
+        return None, None, f"  [{num}/{total_chapters}] {title}: Error - {e}"
+
+    if analysis.error:
+        return None, None, f"  [{num}/{total_chapters}] {title}: Error - {analysis.error}"
+
+    formatted = formatter(analysis)
+    out_path.write_text(formatted)
+
+    cost_str = f" (${analysis.usage.total_cost:.4f})" if analysis.usage else ""
+    msg = f"  [{num}/{total_chapters}] {title} ({start} - {end or 'end'}){cost_str}"
+    return out_path, analysis.usage, msg
+
+
 def split_youtube_video(
     client,
     url: str,
@@ -1491,11 +1550,13 @@ def split_youtube_video(
     verbose: bool = False,
     fps: float | None = None,
     media_resolution: str | None = None,
+    max_workers: int = 4,
 ) -> list[Path]:
-    """Process a YouTube video in chunks, one per chapter.
+    """Process a YouTube video in chunks, one per chapter (parallelized).
 
     Each chapter is processed as an independent --clip call to the Gemini API,
-    producing a separate output file per chapter.
+    producing a separate output file per chapter. Chapters are processed
+    concurrently using a thread pool.
 
     Args:
         client: Gemini API client.
@@ -1508,85 +1569,61 @@ def split_youtube_video(
         verbose: Print progress messages.
         fps: Frame sampling rate.
         media_resolution: Video resolution setting.
+        max_workers: Maximum concurrent API calls (default: 4).
 
     Returns:
         List of paths to the created output files.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     output_dir.mkdir(parents=True, exist_ok=True)
     formatter = format_output_json if output_format == "json" else format_output_markdown
     extension = "json" if output_format == "json" else "md"
     created_files = []
     total_usage = UsageStats()
+    total = len(chapters)
 
-    for chapter in chapters:
-        num = chapter.get("segment_number", 0)
-        title = chapter.get("title", "untitled")
-        start = chapter.get("start_time", "")
-        end = chapter.get("end_time", "")
+    click.echo(f"Processing {total} chapters with {max_workers} workers...", err=True)
 
-        if not start:
-            continue
-
-        # Convert timestamps to API format
-        try:
-            clip_start = parse_timestamp_to_seconds(start)
-            clip_end = parse_timestamp_to_seconds(end) if end else None
-        except click.ClickException:
-            if verbose:
-                click.echo(f"  Skipping chapter {num}: invalid timestamps", err=True)
-            continue
-
-        safe_title = _sanitize_filename(title)
-        filename = f"{num:02d}_{safe_title}.{extension}"
-        out_path = output_dir / filename
-
-        click.echo(
-            f"\n  [{num}/{len(chapters)}] {title} ({start} - {end or 'end'})",
-            err=True,
-        )
-
-        try:
-            analysis = process_video(
+    futures = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for chapter in chapters:
+            future = executor.submit(
+                _process_single_chapter,
                 client,
                 url,
+                chapter,
+                total,
                 analysis_prompt,
                 model,
-                response_schema=None,
-                fps=fps,
-                clip_start=clip_start,
-                clip_end=clip_end,
-                media_resolution=media_resolution,
+                output_dir,
+                formatter,
+                extension,
+                verbose,
+                fps,
+                media_resolution,
             )
-        except Exception as e:
-            click.echo(f"    Error: {e}", err=True)
-            continue
+            futures[future] = chapter
 
-        if analysis.error:
-            click.echo(f"    Error: {analysis.error}", err=True)
-            continue
+        for future in as_completed(futures):
+            out_path, usage, msg = future.result()
+            click.echo(msg, err=True)
 
-        # Accumulate usage
-        if analysis.usage:
-            total_usage.input_tokens += analysis.usage.input_tokens
-            total_usage.output_tokens += analysis.usage.output_tokens
-            total_usage.total_tokens += analysis.usage.total_tokens
-            total_usage.input_cost += analysis.usage.input_cost
-            total_usage.output_cost += analysis.usage.output_cost
-            total_usage.total_cost += analysis.usage.total_cost
+            if out_path:
+                created_files.append(out_path)
+            if usage:
+                total_usage.input_tokens += usage.input_tokens
+                total_usage.output_tokens += usage.output_tokens
+                total_usage.total_tokens += usage.total_tokens
+                total_usage.input_cost += usage.input_cost
+                total_usage.output_cost += usage.output_cost
+                total_usage.total_cost += usage.total_cost
 
-        formatted = formatter(analysis)
-        out_path.write_text(formatted)
-        created_files.append(out_path)
-
-        if verbose and analysis.usage:
-            click.echo(
-                f"    Saved: {filename} "
-                f"(${analysis.usage.total_cost:.4f})",
-                err=True,
-            )
+    # Sort by filename for consistent output
+    created_files.sort()
 
     click.echo(
-        f"\nProcessed {len(created_files)}/{len(chapters)} chapters. "
+        f"\nProcessed {len(created_files)}/{total} chapters. "
         f"Total: {total_usage.total_tokens:,} tokens, ${total_usage.total_cost:.4f}",
         err=True,
     )
@@ -1756,6 +1793,12 @@ def get_safe_filename(input_source: str) -> str:
     "YouTube URLs: fetches chapters and processes each chunk independently.",
 )
 @click.option(
+    "--workers",
+    type=int,
+    default=4,
+    help="Number of parallel workers for --split with YouTube URLs (default: 4).",
+)
+@click.option(
     "--upload-only",
     is_flag=True,
     help="Upload file to Files API and print reference without processing",
@@ -1807,6 +1850,7 @@ def main(
     location: str | None,
     verbose: bool,
     split: bool,
+    workers: int,
     upload_only: bool,
     list_files: bool,
     delete_file: str | None,
@@ -2071,6 +2115,7 @@ def main(
             verbose=verbose,
             fps=fps,
             media_resolution=resolved_media_resolution,
+            max_workers=workers,
         )
 
         click.echo(f"\nCreated {len(created)} chapter files in {split_out}", err=True)

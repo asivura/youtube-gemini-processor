@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "youtube-gemini-processor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Universal CLI tool to process YouTube videos using Google's Gemini API - extracts transcripts and visual content descriptions"
 readme = "README.md"
 license = "MIT"

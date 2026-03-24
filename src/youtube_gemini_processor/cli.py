@@ -413,9 +413,10 @@ def get_gemini_client(
         )
         gcp_location = (
             location
+            or os.environ.get("YT_PROCESS_LOCATION")
             or os.environ.get("GOOGLE_CLOUD_LOCATION")
             or os.environ.get("CLOUDSDK_COMPUTE_REGION")
-            or "us-central1"
+            or "global"
         )
 
         if not gcp_project:
@@ -1778,7 +1779,7 @@ def get_safe_filename(input_source: str) -> str:
     "--location",
     type=str,
     default=None,
-    help="GCP location for Vertex AI (default: global for gemini-3-*, us-central1 for others)",
+    help="GCP location for Vertex AI (default: global)",
 )
 @click.option(
     "--verbose",
@@ -1943,15 +1944,14 @@ def main(
         GOOGLE_API_KEY           Alternative API key variable
         YT_PROCESS_PROJECT       GCP project for Vertex AI (tool-specific)
         GOOGLE_CLOUD_PROJECT     GCP project for Vertex AI (fallback)
-        GOOGLE_CLOUD_LOCATION    GCP location (default: us-central1)
+        YT_PROCESS_LOCATION      GCP location (tool-specific, preferred)
+        GOOGLE_CLOUD_LOCATION    GCP location (fallback, default: global)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
     """
     # Auto-detect location based on model if not specified
     if location is None:
-        if model.startswith("gemini-3"):
-            location = "global"
-        else:
-            location = "us-central1"
+        # Default to global for all models to avoid regional quota limits
+        location = "global"
 
     # Parse video processing options
     clip_start: str | None = None

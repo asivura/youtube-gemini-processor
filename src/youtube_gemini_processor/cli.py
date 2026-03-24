@@ -413,6 +413,7 @@ def get_gemini_client(
         )
         gcp_location = (
             location
+            or os.environ.get("YT_PROCESS_LOCATION")
             or os.environ.get("GOOGLE_CLOUD_LOCATION")
             or os.environ.get("CLOUDSDK_COMPUTE_REGION")
             or "global"
@@ -1943,7 +1944,8 @@ def main(
         GOOGLE_API_KEY           Alternative API key variable
         YT_PROCESS_PROJECT       GCP project for Vertex AI (tool-specific)
         GOOGLE_CLOUD_PROJECT     GCP project for Vertex AI (fallback)
-        GOOGLE_CLOUD_LOCATION    GCP location (default: global)
+        YT_PROCESS_LOCATION      GCP location (tool-specific, preferred)
+        GOOGLE_CLOUD_LOCATION    GCP location (fallback, default: global)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
     """
     # Auto-detect location based on model if not specified

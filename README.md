@@ -98,7 +98,8 @@ yt-process "./video.mp4"
 |----------|-------------|
 | `YT_PROCESS_PROJECT` | GCP project ID (preferred, tool-specific) |
 | `GOOGLE_CLOUD_PROJECT` | GCP project ID (fallback) |
-| `GOOGLE_CLOUD_LOCATION` | GCP region (default: `global`) |
+| `YT_PROCESS_LOCATION` | GCP region (preferred, tool-specific) |
+| `GOOGLE_CLOUD_LOCATION` | GCP region (fallback, default: `global`) |
 | `GOOGLE_GENAI_USE_VERTEXAI` | Set to `true` to auto-enable Vertex AI without `--vertex` flag |
 
 **Note:** The Gemini Files API (used for local file uploads, `--upload-only`, `--list-files`) is not available with Vertex AI. To process local files with Vertex AI, upload them to GCS first (see [GCS URIs](#gcs-uris) below).

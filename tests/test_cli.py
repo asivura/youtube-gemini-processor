@@ -430,10 +430,13 @@ class TestCLIIntegration:
 
     def test_version_option(self) -> None:
         """Test --version flag works."""
+        from importlib.metadata import version
+
+        expected_version = version("youtube-gemini-processor")
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "0.1.0" in result.output
+        assert expected_version in result.output
 
     @patch("youtube_gemini_processor.cli.get_gemini_client")
     def test_process_youtube_url_calls_process_video(
@@ -973,8 +976,10 @@ class TestCLISegmentsMode:
         result = runner.invoke(main, ["--help"])
         assert "--split" in result.output
 
-    def test_split_without_segments_mode_errors(self) -> None:
+    def test_split_without_segments_mode_errors(self, monkeypatch) -> None:
         """Test --split without --mode segments raises error."""
+        monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)
+        monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
         runner = CliRunner()
         result = runner.invoke(
             main,

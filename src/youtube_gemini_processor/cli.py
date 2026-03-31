@@ -1530,7 +1530,11 @@ def _process_single_chapter(
         return None, None, f"  [{num}/{total_chapters}] {title}: Error - {e}"
 
     if analysis.error:
-        return None, None, f"  [{num}/{total_chapters}] {title}: Error - {analysis.error}"
+        return (
+            None,
+            None,
+            f"  [{num}/{total_chapters}] {title}: Error - {analysis.error}",
+        )
 
     formatted = formatter(analysis)
     out_path.write_text(formatted)
@@ -1578,7 +1582,9 @@ def split_youtube_video(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    formatter = format_output_json if output_format == "json" else format_output_markdown
+    formatter = (
+        format_output_json if output_format == "json" else format_output_markdown
+    )
     extension = "json" if output_format == "json" else "md"
     created_files = []
     total_usage = UsageStats()
@@ -2001,7 +2007,13 @@ def main(
     if input and batch:
         raise click.ClickException("Cannot specify both INPUT and --batch")
 
-    if split and input and not is_youtube_url(input) and mode != "segments" and not prompt:
+    if (
+        split
+        and input
+        and not is_youtube_url(input)
+        and mode != "segments"
+        and not prompt
+    ):
         raise click.ClickException("--split requires --mode segments for local files")
 
     if upload_only and batch:

@@ -468,6 +468,16 @@ def extract_video_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _normalize_timestamp_to_hhmmss(timestamp: str) -> str:
+    """Normalize a MM:SS or HH:MM:SS timestamp to HH:MM:SS format."""
+    parts = timestamp.split(":")
+    if len(parts) == 2:
+        return f"00:{parts[0].zfill(2)}:{parts[1]}"
+    if len(parts) == 3:
+        return f"{parts[0].zfill(2)}:{parts[1]}:{parts[2]}"
+    return timestamp
+
+
 def fetch_youtube_chapters(url: str) -> list[dict]:
     """Fetch chapter timestamps from a YouTube video description.
 
@@ -522,21 +532,11 @@ def fetch_youtube_chapters(url: str) -> list[dict]:
         start_time = m.group(1)
         title = m.group(2).strip()
 
-        # Normalize to HH:MM:SS
-        parts = start_time.split(":")
-        if len(parts) == 2:
-            start_time = f"00:{parts[0].zfill(2)}:{parts[1]}"
-        elif len(parts) == 3:
-            start_time = f"{parts[0].zfill(2)}:{parts[1]}:{parts[2]}"
+        start_time = _normalize_timestamp_to_hhmmss(start_time)
 
         # End time is start of next chapter, or empty for last
         if i + 1 < len(matches):
-            end_time = matches[i + 1].group(1)
-            end_parts = end_time.split(":")
-            if len(end_parts) == 2:
-                end_time = f"00:{end_parts[0].zfill(2)}:{end_parts[1]}"
-            elif len(end_parts) == 3:
-                end_time = f"{end_parts[0].zfill(2)}:{end_parts[1]}:{end_parts[2]}"
+            end_time = _normalize_timestamp_to_hhmmss(matches[i + 1].group(1))
         else:
             end_time = ""
 
@@ -769,6 +769,14 @@ def normalize_files_api_ref(input_str: str) -> str:
     )
 
 
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def get_video_duration(file_path: str) -> str | None:
     """Get video duration in HH:MM:SS format using ffprobe.
 
@@ -795,10 +803,7 @@ def get_video_duration(file_path: str) -> str | None:
         if result.returncode != 0:
             return None
         seconds = float(result.stdout.strip())
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return _format_duration(seconds)
     except (ValueError, OSError):
         return None
 
@@ -854,10 +859,7 @@ def get_video_duration_gcs(gcs_uri: str) -> str | None:
         if result.returncode != 0:
             return None
         seconds = float(result.stdout.strip())
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return _format_duration(seconds)
     except (ValueError, OSError):
         return None
 
@@ -874,6 +876,80 @@ def get_video_mime_type(file_path: Path) -> str:
     return mime_type
 
 
+def _call_gemini_and_parse(
+    client,
+    video_part,
+    model: str,
+    prompt: str,
+    analysis: VideoAnalysis,
+    fallback_title: str = "",
+    response_schema: dict | None = None,
+    media_resolution: str | None = None,
+) -> None:
+    """Call Gemini API and parse the response into a VideoAnalysis.
+
+    Handles the generate_content call, usage stats extraction,
+    title extraction, and summary extraction. Mutates `analysis` in place.
+
+    Args:
+        client: Gemini API client.
+        video_part: The video Part object for the request.
+        model: Model name.
+        prompt: The analysis prompt text.
+        analysis: VideoAnalysis object to populate.
+        fallback_title: Title to use if none is extracted from the response.
+        response_schema: Optional JSON schema for structured output.
+        media_resolution: Optional media resolution setting.
+    """
+    from google.genai import types
+
+    config = build_generate_config(
+        model,
+        response_schema=response_schema,
+        media_resolution=media_resolution,
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[video_part, types.Part(text=prompt)],
+            )
+        ],
+        config=config,
+    )
+
+    analysis.raw_response = response.text
+
+    # Extract usage stats from response
+    if hasattr(response, "usage_metadata") and response.usage_metadata:
+        usage = response.usage_metadata
+        input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        analysis.usage = calculate_cost(model, input_tokens, output_tokens)
+
+    # Try to extract title from response
+    title_match = re.search(
+        r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
+        response.text,
+        re.IGNORECASE,
+    )
+    if title_match:
+        analysis.title = title_match.group(1).strip()
+    elif fallback_title:
+        analysis.title = fallback_title
+
+    # Extract summary if present
+    summary_match = re.search(
+        r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
+        response.text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if summary_match:
+        analysis.summary = summary_match.group(1).strip()
+
+
 def process_local_file(
     client,
     file_path: str,
@@ -887,8 +963,6 @@ def process_local_file(
     media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a local video file with Gemini API using Files API."""
-    from google.genai import types
-
     path = Path(file_path).resolve()
 
     analysis = VideoAnalysis(
@@ -930,51 +1004,16 @@ def process_local_file(
             clip_start=clip_start,
             clip_end=clip_end,
         )
-        config = build_generate_config(
+        _call_gemini_and_parse(
+            client,
+            video_part,
             model,
+            prompt,
+            analysis,
+            fallback_title=path.stem,
             response_schema=response_schema,
             media_resolution=media_resolution,
         )
-
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[video_part, types.Part(text=prompt)],
-                )
-            ],
-            config=config,
-        )
-
-        analysis.raw_response = response.text
-
-        # Extract usage stats from response
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage = response.usage_metadata
-            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
-
-        # Try to extract title from response
-        title_match = re.search(
-            r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
-            response.text,
-            re.IGNORECASE,
-        )
-        if title_match:
-            analysis.title = title_match.group(1).strip()
-        else:
-            analysis.title = path.stem  # Use filename as fallback
-
-        # Extract summary if present
-        summary_match = re.search(
-            r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
-            response.text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if summary_match:
-            analysis.summary = summary_match.group(1).strip()
 
     except Exception as e:
         analysis.error = str(e)
@@ -999,7 +1038,6 @@ def process_files_api_ref(
     Skips upload entirely and uses a previously uploaded file.
     Files API references expire after 48 hours.
     """
-    from google.genai import types
 
     file_name = normalize_files_api_ref(file_ref)
 
@@ -1045,52 +1083,17 @@ def process_files_api_ref(
             clip_start=clip_start,
             clip_end=clip_end,
         )
-        config = build_generate_config(
+        display = getattr(file_info, "display_name", None) or file_name
+        _call_gemini_and_parse(
+            client,
+            video_part,
             model,
+            prompt,
+            analysis,
+            fallback_title=Path(display).stem,
             response_schema=response_schema,
             media_resolution=media_resolution,
         )
-
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[video_part, types.Part(text=prompt)],
-                )
-            ],
-            config=config,
-        )
-
-        analysis.raw_response = response.text
-
-        # Extract usage stats from response
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage = response.usage_metadata
-            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
-
-        # Try to extract title from response
-        title_match = re.search(
-            r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
-            response.text,
-            re.IGNORECASE,
-        )
-        if title_match:
-            analysis.title = title_match.group(1).strip()
-        else:
-            display = getattr(file_info, "display_name", None) or file_name
-            analysis.title = Path(display).stem
-
-        # Extract summary if present
-        summary_match = re.search(
-            r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
-            response.text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if summary_match:
-            analysis.summary = summary_match.group(1).strip()
 
     except click.ClickException:
         raise
@@ -1113,8 +1116,6 @@ def process_gcs_uri(
     media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a video from Google Cloud Storage with Gemini API."""
-    from google.genai import types
-
     # Extract filename from GCS URI for display
     filename = gcs_uri.split("/")[-1]
 
@@ -1139,51 +1140,16 @@ def process_gcs_uri(
             clip_start=clip_start,
             clip_end=clip_end,
         )
-        config = build_generate_config(
+        _call_gemini_and_parse(
+            client,
+            video_part,
             model,
+            prompt,
+            analysis,
+            fallback_title=Path(filename).stem,
             response_schema=response_schema,
             media_resolution=media_resolution,
         )
-
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[video_part, types.Part(text=prompt)],
-                )
-            ],
-            config=config,
-        )
-
-        analysis.raw_response = response.text
-
-        # Extract usage stats from response
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage = response.usage_metadata
-            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
-
-        # Try to extract title from response
-        title_match = re.search(
-            r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
-            response.text,
-            re.IGNORECASE,
-        )
-        if title_match:
-            analysis.title = title_match.group(1).strip()
-        else:
-            analysis.title = Path(filename).stem  # Use filename as fallback
-
-        # Extract summary if present
-        summary_match = re.search(
-            r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
-            response.text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if summary_match:
-            analysis.summary = summary_match.group(1).strip()
 
     except Exception as e:
         analysis.error = str(e)
@@ -1203,8 +1169,6 @@ def process_video(
     media_resolution: str | None = None,
 ) -> VideoAnalysis:
     """Process a single YouTube video with Gemini API."""
-    from google.genai import types
-
     normalized_url = validate_youtube_url(url)
 
     analysis = VideoAnalysis(
@@ -1221,49 +1185,15 @@ def process_video(
             clip_start=clip_start,
             clip_end=clip_end,
         )
-        config = build_generate_config(
+        _call_gemini_and_parse(
+            client,
+            video_part,
             model,
+            prompt,
+            analysis,
             response_schema=response_schema,
             media_resolution=media_resolution,
         )
-
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[video_part, types.Part(text=prompt)],
-                )
-            ],
-            config=config,
-        )
-
-        analysis.raw_response = response.text
-
-        # Extract usage stats from response
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage = response.usage_metadata
-            input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-            output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-            analysis.usage = calculate_cost(model, input_tokens, output_tokens)
-
-        # Try to extract title from response
-        title_match = re.search(
-            r"(?:title|video)[:\s]*[\"']?([^\n\"']+)[\"']?",
-            response.text,
-            re.IGNORECASE,
-        )
-        if title_match:
-            analysis.title = title_match.group(1).strip()
-
-        # Extract summary if present
-        summary_match = re.search(
-            r"(?:## (?:5\. )?summary|summary:)\s*\n(.*?)(?=\n## |\n\*\*|\Z)",
-            response.text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if summary_match:
-            analysis.summary = summary_match.group(1).strip()
 
     except Exception as e:
         analysis.error = str(e)
@@ -1708,6 +1638,150 @@ def get_safe_filename(input_source: str) -> str:
     return f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
+def _handle_file_management(
+    client,
+    list_files: bool,
+    delete_file: str | None,
+) -> None:
+    """Handle --list-files and --delete-file operations."""
+    if list_files:
+        click.echo("Uploaded files:", err=True)
+        found = False
+        for f in client.files.list():
+            found = True
+            state = getattr(f.state, "name", "UNKNOWN")
+            display = getattr(f, "display_name", "") or ""
+            expire = getattr(f, "expiration_time", "") or ""
+            line = f"  {f.name:<30} {state:<10}"
+            if display:
+                line += f" {display}"
+            if expire:
+                line += f"  (expires: {expire})"
+            click.echo(line)
+        if not found:
+            click.echo("  (no files uploaded)")
+    if delete_file:
+        name = normalize_files_api_ref(delete_file)
+        client.files.delete(name=name)
+        click.echo(f"Deleted: {name}", err=True)
+
+
+def _handle_upload_only(
+    client,
+    source: str,
+    verbose: bool,
+) -> None:
+    """Handle --upload-only mode: upload file and print reference."""
+    import time
+
+    if not is_local_file(source):
+        raise click.ClickException("--upload-only requires a local file path as input")
+
+    path = Path(source).resolve()
+    mime_type = get_video_mime_type(path)
+    file_size_mb = path.stat().st_size / (1024 * 1024)
+
+    click.echo(f"Uploading {path.name} ({file_size_mb:.1f} MB)...", err=True)
+    uploaded_file = client.files.upload(file=str(path))
+    click.echo("Waiting for processing...", err=True)
+
+    while uploaded_file.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded_file = client.files.get(name=uploaded_file.name)
+
+    if uploaded_file.state.name == "FAILED":
+        raise click.ClickException(f"File processing failed: {uploaded_file.name}")
+
+    click.echo(uploaded_file.name)
+    if verbose:
+        click.echo(f"  URI: {uploaded_file.uri}", err=True)
+        click.echo(f"  MIME type: {mime_type}", err=True)
+        expire = getattr(uploaded_file, "expiration_time", None)
+        if expire:
+            click.echo(f"  Expires: {expire}", err=True)
+
+
+def _handle_chapter_splitting(
+    client,
+    url: str,
+    analysis_prompt: str,
+    model: str,
+    output: str | None,
+    output_format: str,
+    verbose: bool,
+    fps: float | None,
+    media_resolution: str | None,
+    workers: int,
+) -> None:
+    """Handle YouTube chapter-based splitting (--split without segments mode)."""
+    click.echo("Fetching YouTube chapters...", err=True)
+    chapters = fetch_youtube_chapters(url)
+
+    if not chapters:
+        raise click.ClickException(
+            "No YouTube chapters found in video description. "
+            "Use --mode segments to detect chapters with AI, or process manually with --clip."
+        )
+
+    click.echo(f"Found {len(chapters)} chapters:", err=True)
+    for ch in chapters:
+        click.echo(
+            f"  {ch['segment_number']:2d}. [{ch['start_time']} - {ch['end_time'] or 'end'}] "
+            f"{ch['title']}",
+            err=True,
+        )
+
+    # Determine output directory
+    if output:
+        split_out = Path(output)
+    else:
+        video_id = extract_video_id(url) or "youtube"
+        split_out = Path(f"split_{video_id}")
+
+    created = split_youtube_video(
+        client=client,
+        url=url,
+        chapters=chapters,
+        analysis_prompt=analysis_prompt,
+        model=model,
+        output_dir=split_out,
+        output_format=output_format,
+        verbose=verbose,
+        fps=fps,
+        media_resolution=media_resolution,
+        max_workers=workers,
+    )
+
+    click.echo(f"\nCreated {len(created)} chapter files in {split_out}", err=True)
+
+
+def _handle_output(
+    formatted: str,
+    video_input: str,
+    extension: str,
+    output_dir_path: Path | None,
+    output_file: Path | None,
+    is_batch: bool,
+    verbose: bool,
+) -> None:
+    """Handle writing formatted output to file or stdout."""
+    if output_dir_path:
+        # Batch mode: write each to separate file
+        filename = f"{get_safe_filename(video_input)}.{extension}"
+        file_path = output_dir_path / filename
+        file_path.write_text(formatted)
+        if verbose:
+            click.echo(f"  Saved to: {file_path}")
+    elif output_file and not is_batch:
+        # Single file output
+        output_file.write_text(formatted)
+        if verbose:
+            click.echo(f"Saved to: {output_file}")
+    elif not output_dir_path and not output_file:
+        # Print to stdout
+        click.echo(formatted)
+
+
 @click.command()
 @click.argument("input", required=False)
 @click.option(
@@ -1960,26 +2034,7 @@ def main(
             project=project,
             location=location,
         )
-        if list_files:
-            click.echo("Uploaded files:", err=True)
-            found = False
-            for f in client.files.list():
-                found = True
-                state = getattr(f.state, "name", "UNKNOWN")
-                display = getattr(f, "display_name", "") or ""
-                expire = getattr(f, "expiration_time", "") or ""
-                line = f"  {f.name:<30} {state:<10}"
-                if display:
-                    line += f" {display}"
-                if expire:
-                    line += f"  (expires: {expire})"
-                click.echo(line)
-            if not found:
-                click.echo("  (no files uploaded)")
-        if delete_file:
-            name = normalize_files_api_ref(delete_file)
-            client.files.delete(name=name)
-            click.echo(f"Deleted: {name}", err=True)
+        _handle_file_management(client, list_files, delete_file)
         return
 
     if not input and not batch:
@@ -2012,33 +2067,11 @@ def main(
 
     # Handle upload-only mode
     if upload_only:
-        if not input or not is_local_file(input):
+        if not input:
             raise click.ClickException(
                 "--upload-only requires a local file path as input"
             )
-
-        path = Path(input).resolve()
-        mime_type = get_video_mime_type(path)
-        file_size_mb = path.stat().st_size / (1024 * 1024)
-
-        click.echo(f"Uploading {path.name} ({file_size_mb:.1f} MB)...", err=True)
-        uploaded_file = client.files.upload(file=str(path))
-        click.echo("Waiting for processing...", err=True)
-
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(2)
-            uploaded_file = client.files.get(name=uploaded_file.name)
-
-        if uploaded_file.state.name == "FAILED":
-            raise click.ClickException(f"File processing failed: {uploaded_file.name}")
-
-        click.echo(uploaded_file.name)
-        if verbose:
-            click.echo(f"  URI: {uploaded_file.uri}", err=True)
-            click.echo(f"  MIME type: {mime_type}", err=True)
-            expire = getattr(uploaded_file, "expiration_time", None)
-            if expire:
-                click.echo(f"  Expires: {expire}", err=True)
+        _handle_upload_only(client, input, verbose)
         return
 
     # Determine prompt
@@ -2074,45 +2107,18 @@ def main(
 
     # YouTube chunked processing: --split with YouTube URL (not segments mode)
     if split and input and is_youtube_url(input) and not is_segments_mode:
-        click.echo("Fetching YouTube chapters...", err=True)
-        chapters = fetch_youtube_chapters(input)
-
-        if not chapters:
-            raise click.ClickException(
-                "No YouTube chapters found in video description. "
-                "Use --mode segments to detect chapters with AI, or process manually with --clip."
-            )
-
-        click.echo(f"Found {len(chapters)} chapters:", err=True)
-        for ch in chapters:
-            click.echo(
-                f"  {ch['segment_number']:2d}. [{ch['start_time']} - {ch['end_time'] or 'end'}] "
-                f"{ch['title']}",
-                err=True,
-            )
-
-        # Determine output directory
-        if output:
-            split_out = Path(output)
-        else:
-            video_id = extract_video_id(input) or "youtube"
-            split_out = Path(f"split_{video_id}")
-
-        created = split_youtube_video(
+        _handle_chapter_splitting(
             client=client,
             url=input,
-            chapters=chapters,
             analysis_prompt=analysis_prompt,
             model=model,
-            output_dir=split_out,
+            output=output,
             output_format=output_format,
             verbose=verbose,
             fps=fps,
             media_resolution=resolved_media_resolution,
-            max_workers=workers,
+            workers=workers,
         )
-
-        click.echo(f"\nCreated {len(created)} chapter files in {split_out}", err=True)
         return
 
     # Process videos
@@ -2238,21 +2244,15 @@ def main(
             else:
                 formatted = formatter(analysis)
 
-            if output_dir_path:
-                # Batch mode: write each to separate file
-                filename = f"{get_safe_filename(video_input)}.{extension}"
-                file_path = output_dir_path / filename
-                file_path.write_text(formatted)
-                if verbose:
-                    click.echo(f"  Saved to: {file_path}")
-            elif output_file and not is_batch:
-                # Single file output
-                output_file.write_text(formatted)
-                if verbose:
-                    click.echo(f"Saved to: {output_file}")
-            elif not output:
-                # Print to stdout
-                click.echo(formatted)
+            _handle_output(
+                formatted,
+                video_input,
+                extension,
+                output_dir_path,
+                output_file,
+                is_batch,
+                verbose,
+            )
 
     # Summary for batch mode
     if is_batch:

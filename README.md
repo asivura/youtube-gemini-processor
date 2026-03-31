@@ -1,5 +1,7 @@
 # YouTube Gemini Processor
 
+[![CI](https://github.com/alexandersivura/youtube-gemini-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/alexandersivura/youtube-gemini-processor/actions/workflows/ci.yml)
+
 A CLI tool to process videos using Google's Gemini API. Supports YouTube URLs, local video files, Google Cloud Storage URIs, and the Gemini Files API. Extracts comprehensive content including transcripts, visual descriptions, and structured segment analysis.
 
 ## Features

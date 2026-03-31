@@ -43,7 +43,10 @@ htmlcov/
 
 # uv
 .uv/
-uv.lock
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
 
 # Environment
 .env

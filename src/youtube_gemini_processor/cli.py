@@ -37,16 +37,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import urllib.parse
-from dataclasses import dataclass, field
+import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import click
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass
@@ -67,10 +65,6 @@ class VideoAnalysis:
 
     url: str
     title: str = ""
-    duration: str = ""
-    transcript: str = ""
-    visual_descriptions: list[dict] = field(default_factory=list)
-    key_topics: list[str] = field(default_factory=list)
     summary: str = ""
     raw_response: str = ""
     processed_at: str = ""
@@ -312,7 +306,7 @@ PROMPTS = {
     "segments": SEGMENTS_PROMPT,
 }
 
-# Pricing per 1M tokens (as of Jan 2025)
+# Pricing per 1M tokens
 # https://ai.google.dev/pricing
 MODEL_PRICING = {
     "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},  # Per 1M tokens
@@ -484,8 +478,6 @@ def fetch_youtube_chapters(url: str) -> list[dict]:
         List of segment dicts with segment_number, start_time, end_time, title.
         Empty list if no chapters found.
     """
-    import urllib.request
-
     video_id = extract_video_id(url)
     if not video_id:
         return []
@@ -613,10 +605,10 @@ def parse_timestamp_to_seconds(timestamp: str) -> str:
 
     parts = timestamp.split(":")
     try:
-        if len(parts) == 2:  # noqa: PLR2004
+        if len(parts) == 2:
             minutes, seconds = int(parts[0]), int(parts[1])
             return f"{minutes * 60 + seconds}s"
-        if len(parts) == 3:  # noqa: PLR2004
+        if len(parts) == 3:
             hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
             return f"{hours * 3600 + minutes * 60 + seconds}s"
     except ValueError:
@@ -649,9 +641,9 @@ def parse_clip_range(clip: str) -> tuple[str, str]:
     # Handle HH:MM:SS-HH:MM:SS by finding the separator hyphen
     # A separator hyphen is one that's NOT preceded by a colon
     parts = clip.split("-")
-    if len(parts) == 2:  # noqa: PLR2004
+    if len(parts) == 2:
         start_str, end_str = parts
-    elif len(parts) > 2:  # noqa: PLR2004
+    elif len(parts) > 2:
         # Could be HH:MM:SS-HH:MM:SS which has no extra hyphens,
         # or raw seconds like 90-300. Try first hyphen after pos 0.
         dash_idx = clip.find("-", 1)
@@ -798,6 +790,7 @@ def get_video_duration(file_path: str) -> str | None:
             ],
             capture_output=True,
             text=True,
+            timeout=300,
         )
         if result.returncode != 0:
             return None
@@ -837,7 +830,7 @@ def get_video_duration_gcs(gcs_uri: str) -> str | None:
         credentials, _ = google.auth.default()
         credentials.refresh(google.auth.transport.requests.Request())
         token = credentials.token
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
     try:
@@ -856,6 +849,7 @@ def get_video_duration_gcs(gcs_uri: str) -> str | None:
             ],
             capture_output=True,
             text=True,
+            timeout=300,
         )
         if result.returncode != 0:
             return None
@@ -919,8 +913,6 @@ def process_local_file(
         )
 
         # Wait for file to be processed
-        import time
-
         while uploaded_file.state.name == "PROCESSING":
             if verbose:
                 click.echo("  Waiting for file processing...", err=True)
@@ -994,7 +986,7 @@ def process_files_api_ref(
     client,
     file_ref: str,
     prompt: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-3-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
     fps: float | None = None,
@@ -1007,8 +999,6 @@ def process_files_api_ref(
     Skips upload entirely and uses a previously uploaded file.
     Files API references expire after 48 hours.
     """
-    import time
-
     from google.genai import types
 
     file_name = normalize_files_api_ref(file_ref)
@@ -1465,6 +1455,7 @@ def split_video(
             cmd,
             capture_output=True,
             text=True,
+            timeout=300,
         )
 
         if result.returncode != 0:
@@ -1754,15 +1745,7 @@ def get_safe_filename(input_source: str) -> str:
 )
 @click.option(
     "--model",
-    type=click.Choice(
-        [
-            "gemini-3-flash-preview",
-            "gemini-3-pro-preview",
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "gemini-2.0-flash",
-        ]
-    ),
+    type=click.Choice(list(MODEL_PRICING.keys())),
     default="gemini-3-pro-preview",
     help="Gemini model to use (default: gemini-3-pro-preview)",
 )
@@ -2033,7 +2016,6 @@ def main(
             raise click.ClickException(
                 "--upload-only requires a local file path as input"
             )
-        import time
 
         path = Path(input).resolve()
         mime_type = get_video_mime_type(path)

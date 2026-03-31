@@ -48,8 +48,15 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 | `parse_clip_range()` | Parse `"START-END"` clip range string |
 | `build_video_part()` | Build video Part with optional VideoMetadata (fps, clip) |
 | `build_generate_config()` | Build GenerateContentConfig with optional media resolution |
+| `_call_gemini_and_parse()` | Shared helper: call Gemini API and populate VideoAnalysis |
+| `_format_duration()` | Format seconds as HH:MM:SS |
+| `_normalize_timestamp_to_hhmmss()` | Normalize MM:SS or HH:MM:SS timestamps |
 | `calculate_cost()` | Token usage cost calculation with model pricing |
 | `format_output_*()` | Output formatters (markdown, json) |
+| `_handle_file_management()` | Handle `--list-files` and `--delete-file` operations |
+| `_handle_upload_only()` | Handle `--upload-only` mode |
+| `_handle_chapter_splitting()` | Handle YouTube chapter-based `--split` |
+| `_handle_output()` | Route formatted output to file or stdout |
 
 ## Input Types
 

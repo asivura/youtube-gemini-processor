@@ -26,20 +26,20 @@ No installation needed. Run directly with `uvx`:
 export GEMINI_API_KEY="your-api-key"
 
 # Process a YouTube video
-uvx --from git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git yt-process "https://www.youtube.com/watch?v=VIDEO_ID"
+uvx --from git+ssh://git@github.com/asivura/youtube-gemini-processor.git yt-process "https://www.youtube.com/watch?v=VIDEO_ID"
 
 # Process a local video file
-uvx --from git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git yt-process ./video.mp4
+uvx --from git+ssh://git@github.com/asivura/youtube-gemini-processor.git yt-process ./video.mp4
 ```
 
 ## Installation
 
 ```bash
 # Install from GitHub
-uv pip install git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git
+uv pip install git+ssh://git@github.com/asivura/youtube-gemini-processor.git
 
 # Or clone and install locally
-git clone git@github.com:alexandersivura/youtube-gemini-processor.git
+git clone git@github.com:asivura/youtube-gemini-processor.git
 cd youtube-gemini-processor
 uv pip install -e .
 ```
@@ -325,7 +325,7 @@ Options:
   --media-resolution [low|medium|high]
                                   Frame resolution (default: high)
   --split                        Split video into segments (segments mode) or by chapters (YouTube URLs)
-  -w, --workers INT              Number of parallel workers for batch mode
+  --workers INTEGER               Number of parallel workers for --split with YouTube URLs (default: 4)
   --upload-only                  Upload file and print reference without processing
   --list-files                   List files uploaded to the Files API
   --delete-file TEXT             Delete a Files API reference
@@ -346,7 +346,7 @@ Options:
 Add to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-alias yt-process='uvx --from git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git yt-process'
+alias yt-process='uvx --from git+ssh://git@github.com/asivura/youtube-gemini-processor.git yt-process'
 ```
 
 Then use simply:

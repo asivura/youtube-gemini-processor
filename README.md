@@ -24,20 +24,20 @@ No installation needed. Run directly with `uvx`:
 export GEMINI_API_KEY="your-api-key"
 
 # Process a YouTube video
-uvx --from git+ssh://git@github.com/yourusername/youtube-gemini-processor.git yt-process "https://www.youtube.com/watch?v=VIDEO_ID"
+uvx --from git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git yt-process "https://www.youtube.com/watch?v=VIDEO_ID"
 
 # Process a local video file
-uvx --from git+ssh://git@github.com/yourusername/youtube-gemini-processor.git yt-process ./video.mp4
+uvx --from git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git yt-process ./video.mp4
 ```
 
 ## Installation
 
 ```bash
 # Install from GitHub
-uv pip install git+ssh://git@github.com/yourusername/youtube-gemini-processor.git
+uv pip install git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git
 
 # Or clone and install locally
-git clone git@github.com:yourusername/youtube-gemini-processor.git
+git clone git@github.com:alexandersivura/youtube-gemini-processor.git
 cd youtube-gemini-processor
 uv pip install -e .
 ```
@@ -272,8 +272,11 @@ Identify logical sections of a video with timestamps, speakers, and summaries. U
 # Identify segments
 yt-process "./video.mp4" -m segments
 
-# Identify and split into files (requires ffmpeg, local files only)
+# Identify and split into files (requires ffmpeg)
 yt-process "./video.mp4" -m segments --split
+
+# Split YouTube video by chapters (auto-detected from description)
+yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --split
 
 # Output segments as JSON
 yt-process "./video.mp4" -m segments -f json -o segments.json
@@ -319,7 +322,8 @@ Options:
   --clip TEXT                    Process a clip: START-END (e.g., 1:30-5:00)
   --media-resolution [low|medium|high]
                                   Frame resolution (default: high)
-  --split                        Split video into segments (requires --mode segments)
+  --split                        Split video into segments (segments mode) or by chapters (YouTube URLs)
+  -w, --workers INT              Number of parallel workers for batch mode
   --upload-only                  Upload file and print reference without processing
   --list-files                   List files uploaded to the Files API
   --delete-file TEXT             Delete a Files API reference
@@ -340,7 +344,7 @@ Options:
 Add to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-alias yt-process='uvx --from git+ssh://git@github.com/yourusername/youtube-gemini-processor.git yt-process'
+alias yt-process='uvx --from git+ssh://git@github.com/alexandersivura/youtube-gemini-processor.git yt-process'
 ```
 
 Then use simply:

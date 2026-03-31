@@ -636,10 +636,6 @@ class TestVideoAnalysisDataclass:
         analysis = VideoAnalysis(url="https://test.com")
         assert analysis.url == "https://test.com"
         assert analysis.title == ""
-        assert analysis.duration == ""
-        assert analysis.transcript == ""
-        assert analysis.visual_descriptions == []
-        assert analysis.key_topics == []
         assert analysis.summary == ""
         assert analysis.raw_response == ""
         assert analysis.processed_at == ""
@@ -662,10 +658,6 @@ class TestVideoAnalysisDataclass:
         analysis = VideoAnalysis(
             url="https://test.com",
             title="Test Title",
-            duration="10:30",
-            transcript="Full transcript here",
-            visual_descriptions=[{"time": "00:30", "desc": "Slide 1"}],
-            key_topics=["topic1", "topic2"],
             summary="A summary",
             raw_response="Raw API response",
             processed_at="2024-01-15T10:00:00",
@@ -674,7 +666,7 @@ class TestVideoAnalysisDataclass:
             usage=usage,
         )
         assert analysis.title == "Test Title"
-        assert len(analysis.key_topics) == 2
+        assert analysis.summary == "A summary"
         assert analysis.usage.total_cost == 0.03
 
 

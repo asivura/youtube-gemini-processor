@@ -398,20 +398,8 @@ def get_gemini_client(
     if use_vertex:
         # Vertex AI authentication using Application Default Credentials
         # Requires: gcloud auth application-default login
-        gcp_project = (
-            project
-            or os.environ.get("YT_PROCESS_PROJECT")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or os.environ.get("GCP_PROJECT")
-            or os.environ.get("CLOUDSDK_CORE_PROJECT")
-        )
-        gcp_location = (
-            location
-            or os.environ.get("YT_PROCESS_LOCATION")
-            or os.environ.get("GOOGLE_CLOUD_LOCATION")
-            or os.environ.get("CLOUDSDK_COMPUTE_REGION")
-            or "global"
-        )
+        gcp_project = project or os.environ.get("YT_PROCESS_PROJECT")
+        gcp_location = location or os.environ.get("YT_PROCESS_LOCATION") or "global"
 
         if not gcp_project:
             raise click.ClickException(
@@ -2005,10 +1993,8 @@ def main(
     Environment Variables:
         GEMINI_API_KEY           Google Gemini API key
         GOOGLE_API_KEY           Alternative API key variable
-        YT_PROCESS_PROJECT       GCP project for Vertex AI (tool-specific)
-        GOOGLE_CLOUD_PROJECT     GCP project for Vertex AI (fallback)
-        YT_PROCESS_LOCATION      GCP location (tool-specific, preferred)
-        GOOGLE_CLOUD_LOCATION    GCP location (fallback, default: global)
+        YT_PROCESS_PROJECT       GCP project for Vertex AI (required with --vertex)
+        YT_PROCESS_LOCATION      GCP location for Vertex AI (default: global)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
     """
     # Auto-detect location based on model if not specified

@@ -301,7 +301,7 @@ class TestCalculateCost:
     def test_unknown_model_uses_default(self) -> None:
         """Test unknown models use default pricing."""
         stats = calculate_cost("unknown-model", 1_000_000, 100_000)
-        # Should use gemini-3-pro-preview pricing as default
+        # Should use gemini-3.1-pro-preview pricing as default
         assert stats.input_cost == pytest.approx(1.25)
         assert stats.output_cost == pytest.approx(1.00)
 

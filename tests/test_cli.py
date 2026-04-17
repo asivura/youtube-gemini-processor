@@ -319,6 +319,33 @@ class TestCalculateCost:
         assert stats.total_cost == pytest.approx(2.25)
 
 
+class TestPromptDurationLine:
+    """Tests that every built-in analysis prompt accepts {duration_line}.
+
+    Thinking models truncate long transcripts without an explicit duration
+    anchor, so every mode (not just segments) needs this substitution.
+    """
+
+    @pytest.mark.parametrize(
+        "mode", ["comprehensive", "concise", "transcript", "segments"]
+    )
+    def test_prompt_accepts_duration_line_substitution(self, mode: str) -> None:
+        duration_line = (
+            "\nThe media is exactly 01:08:03 long. "
+            "You MUST cover from 00:00:00 to 01:08:03.\n"
+        )
+        rendered = PROMPTS[mode].format(duration_line=duration_line)
+        assert "01:08:03" in rendered
+        assert "{duration_line}" not in rendered
+
+    @pytest.mark.parametrize(
+        "mode", ["comprehensive", "concise", "transcript", "segments"]
+    )
+    def test_prompt_accepts_empty_duration_line(self, mode: str) -> None:
+        rendered = PROMPTS[mode].format(duration_line="")
+        assert "{duration_line}" not in rendered
+
+
 class TestModelChoices:
     """Tests for supported --model choices."""
 

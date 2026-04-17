@@ -75,12 +75,12 @@ class VideoAnalysis:
 
 
 # Default comprehensive analysis prompt - optimized for maximum detail
-DEFAULT_PROMPT = """You are an expert content analyst. Analyze this video with extreme thoroughness and produce a comprehensive markdown document.
-
+DEFAULT_PROMPT = """You are an expert content analyst. Analyze this media with extreme thoroughness and produce a comprehensive markdown document.
+{duration_line}
 # INSTRUCTIONS
-- Watch the ENTIRE video carefully
+- Watch/listen to the ENTIRE media carefully
 - Capture EVERY piece of information: spoken words, visuals, text on screen
-- Be extremely detailed - this document should allow someone to fully understand the video without watching it
+- Be extremely detailed - this document should allow someone to fully understand the media without watching or listening to it
 - Use proper markdown formatting throughout
 
 # OUTPUT FORMAT
@@ -231,8 +231,8 @@ DEFAULT_PROMPT = """You are an expert content analyst. Analyze this video with e
 - Use proper markdown tables, headers, and formatting"""
 
 
-CONCISE_PROMPT = """Analyze this video. Provide:
-
+CONCISE_PROMPT = """Analyze this media. Provide:
+{duration_line}
 1. **Title & Duration**
 2. **Summary** (2-3 paragraphs)
 3. **Key Topics** with timestamps [MM:SS]
@@ -248,8 +248,8 @@ CONCISE_PROMPT = """Analyze this video. Provide:
 Be comprehensive. Capture ALL slide content verbatim and detailed speaker commentary for each slide."""
 
 
-TRANSCRIPT_ONLY_PROMPT = """Provide a complete transcript of this video.
-
+TRANSCRIPT_ONLY_PROMPT = """Provide a complete transcript of this media.
+{duration_line}
 Format with timestamps:
 [MM:SS] "Spoken text..."
 
@@ -2213,9 +2213,12 @@ def main(
             # Use response schema for segments mode to guarantee valid JSON
             schema = SEGMENTS_SCHEMA if is_segments_mode else None
 
-            # For segments mode, detect video duration and inject into prompt
+            # Detect media duration and inject into prompt. Applied for all
+            # built-in modes (comprehensive/concise/transcript/segments) but
+            # skipped for custom --prompt since user text may contain literal
+            # braces that would break str.format().
             video_prompt = analysis_prompt
-            if is_segments_mode:
+            if not prompt:
                 duration = None
                 if is_local_file(video_input):
                     duration = get_video_duration(video_input)
@@ -2224,11 +2227,11 @@ def main(
 
                 if duration:
                     duration_line = (
-                        f"\nThe video is exactly {duration} long. "
+                        f"\nThe media is exactly {duration} long. "
                         f"You MUST cover from 00:00:00 to {duration}.\n"
                     )
                     if verbose:
-                        click.echo(f"  Detected video duration: {duration}", err=True)
+                        click.echo(f"  Detected media duration: {duration}", err=True)
                 else:
                     duration_line = ""
                 video_prompt = analysis_prompt.format(duration_line=duration_line)

@@ -223,8 +223,8 @@ yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --prompt "List all tools, 
 ### Model Selection
 
 ```bash
-yt-process "./video.mp4" --model gemini-3-pro-preview     # Default, best quality
-yt-process "./video.mp4" --model gemini-3.1-pro-preview   # Newer 3 Pro revision (Vertex)
+yt-process "./video.mp4" --model gemini-3.1-pro-preview   # Default, best quality
+yt-process "./video.mp4" --model gemini-3-pro-preview     # Previous 3 Pro revision
 yt-process "./video.mp4" --model gemini-3-flash-preview   # Faster, lower cost
 yt-process "./video.mp4" --model gemini-2.5-pro           # Previous gen, high quality
 yt-process "./video.mp4" --model gemini-2.5-flash         # Previous gen, fast
@@ -294,7 +294,7 @@ yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --split
 yt-process "./video.mp4" -m segments -f json -o segments.json
 ```
 
-**Recommended model for segments:** Use `gemini-3-pro-preview` (the default). Smaller models tend to truncate and only cover the first portion of long videos.
+**Recommended model for segments:** Use `gemini-3.1-pro-preview` (the default). Smaller models tend to truncate and only cover the first portion of long videos.
 
 ### Batch Processing
 
@@ -325,7 +325,7 @@ Options:
                                   Analysis mode (default: comprehensive)
   -p, --prompt TEXT               Custom prompt (overrides --mode)
   --model [gemini-3-pro-preview|gemini-3.1-pro-preview|gemini-3-flash-preview|gemini-2.5-pro|gemini-2.5-flash|gemini-2.0-flash]
-                                  Gemini model (default: gemini-3-pro-preview)
+                                  Gemini model (default: gemini-3.1-pro-preview)
   --api-key TEXT                  Gemini API key (or set GEMINI_API_KEY)
   --vertex                       Use Vertex AI authentication
   --project TEXT                  GCP project for Vertex AI

@@ -361,7 +361,7 @@ SEGMENTS_SCHEMA = {
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageStats:
     """Calculate usage cost based on model and token counts."""
-    pricing = MODEL_PRICING.get(model, MODEL_PRICING["gemini-3-pro-preview"])
+    pricing = MODEL_PRICING.get(model, MODEL_PRICING["gemini-3.1-pro-preview"])
 
     # Convert to cost (pricing is per 1M tokens)
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
@@ -1006,7 +1006,7 @@ def process_local_file(
     client,
     file_path: str,
     prompt: str,
-    model: str = "gemini-3-pro-preview",
+    model: str = "gemini-3.1-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
     fps: float | None = None,
@@ -1163,7 +1163,7 @@ def process_gcs_uri(
     client,
     gcs_uri: str,
     prompt: str,
-    model: str = "gemini-3-pro-preview",
+    model: str = "gemini-3.1-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
     fps: float | None = None,
@@ -1221,7 +1221,7 @@ def process_video(
     client,
     url: str,
     prompt: str,
-    model: str = "gemini-3-pro-preview",
+    model: str = "gemini-3.1-pro-preview",
     response_schema: dict | None = None,
     fps: float | None = None,
     clip_start: str | None = None,
@@ -1881,8 +1881,8 @@ def _handle_output(
 @click.option(
     "--model",
     type=click.Choice(list(MODEL_PRICING.keys())),
-    default="gemini-3-pro-preview",
-    help="Gemini model to use (default: gemini-3-pro-preview)",
+    default="gemini-3.1-pro-preview",
+    help="Gemini model to use (default: gemini-3.1-pro-preview)",
 )
 @click.option(
     "--api-key",

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/alexandersivura/youtube-gemini-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/alexandersivura/youtube-gemini-processor/actions/workflows/ci.yml)
 
-A CLI tool to process videos using Google's Gemini API. Supports YouTube URLs, local video files, Google Cloud Storage URIs, and the Gemini Files API. Extracts comprehensive content including transcripts, visual descriptions, and structured segment analysis.
+A CLI tool to process videos and audio using Google's Gemini API. Supports YouTube URLs, local video/audio files, Google Cloud Storage URIs, and the Gemini Files API. Extracts comprehensive content including transcripts, visual descriptions, and structured segment analysis.
 
 ## Features
 
@@ -129,17 +129,21 @@ yt-process "https://www.youtube.com/shorts/VIDEO_ID"
 
 Only public YouTube videos are supported.
 
-### Local Video Files
+### Local Video and Audio Files
 
-Process video files from your local filesystem. The file is uploaded via the Gemini Files API automatically:
+Process video or audio files from your local filesystem. The file is uploaded via the Gemini Files API automatically:
 
 ```bash
 yt-process ./presentation.mp4
 yt-process /path/to/meeting.mov
 yt-process ~/Videos/demo.webm
+yt-process ./voice-memo.mp3 -m transcript
 ```
 
-Supported formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
+Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
+Supported audio formats: `.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.aac`, `.aiff`, `.aif`
+
+`--fps` and `--media-resolution` are video-only options. Audio inputs still support `--clip` for start/end offsets.
 
 ### Files API References
 
@@ -163,7 +167,7 @@ yt-process --delete-file files/abc123
 
 ### GCS URIs
 
-Process videos stored in Google Cloud Storage. Requires Vertex AI authentication:
+Process videos or audio stored in Google Cloud Storage. Requires Vertex AI authentication:
 
 ```bash
 # Upload to GCS first
@@ -171,6 +175,11 @@ gcloud storage cp "./video.mp4" gs://your-bucket/
 
 # Process via Vertex AI
 yt-process "gs://your-bucket/video.mp4" --vertex --project your-gcp-project
+
+# Audio transcription via Vertex AI
+gcloud storage cp "./voice-memo.mp3" gs://your-bucket/
+yt-process "gs://your-bucket/voice-memo.mp3" \
+  --mode transcript --vertex --project your-gcp-project
 ```
 
 ## Usage

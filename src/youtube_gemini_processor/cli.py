@@ -43,6 +43,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import click
 
@@ -568,6 +569,20 @@ VIDEO_MIME_TYPES = {
     ".3gp": "video/3gpp",
 }
 
+# Supported audio MIME types
+AUDIO_MIME_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+}
+
+MediaKind = Literal["video", "audio"]
+
 
 def is_local_file(input_path: str) -> bool:
     """Check if input is a local file path (exists on disk)."""
@@ -665,20 +680,22 @@ MEDIA_RESOLUTION_MAP = {
 }
 
 
-def build_video_part(
+def build_media_part(
     file_uri: str,
     mime_type: str,
     *,
+    kind: MediaKind = "video",
     fps: float | None = None,
     clip_start: str | None = None,
     clip_end: str | None = None,
 ):
-    """Build a video Part with optional VideoMetadata.
+    """Build a media Part with optional VideoMetadata.
 
     Args:
         file_uri: The file URI (Files API, GCS, or YouTube URL).
-        mime_type: MIME type of the video.
-        fps: Custom frames per second for sampling.
+        mime_type: MIME type of the media.
+        kind: Media kind, "video" or "audio". Audio never attaches VideoMetadata.
+        fps: Custom frames per second for sampling (video only).
         clip_start: Start offset in "{seconds}s" format.
         clip_end: End offset in "{seconds}s" format.
     """
@@ -688,16 +705,23 @@ def build_video_part(
         "file_data": types.FileData(file_uri=file_uri, mime_type=mime_type),
     }
 
-    # Add video metadata if any processing options are set
-    vm_kwargs: dict = {}
-    if fps is not None:
-        vm_kwargs["fps"] = fps
-    if clip_start is not None:
-        vm_kwargs["start_offset"] = clip_start
-    if clip_end is not None:
-        vm_kwargs["end_offset"] = clip_end
+    if kind == "video":
+        vm_kwargs: dict = {}
+        if fps is not None:
+            vm_kwargs["fps"] = fps
+        if clip_start is not None:
+            vm_kwargs["start_offset"] = clip_start
+        if clip_end is not None:
+            vm_kwargs["end_offset"] = clip_end
 
-    if vm_kwargs:
+        if vm_kwargs:
+            part_kwargs["video_metadata"] = types.VideoMetadata(**vm_kwargs)
+    elif clip_start is not None or clip_end is not None:
+        vm_kwargs = {}
+        if clip_start is not None:
+            vm_kwargs["start_offset"] = clip_start
+        if clip_end is not None:
+            vm_kwargs["end_offset"] = clip_end
         part_kwargs["video_metadata"] = types.VideoMetadata(**vm_kwargs)
 
     return types.Part(**part_kwargs)
@@ -733,6 +757,14 @@ def build_generate_config(
 def is_gcs_uri(uri: str) -> bool:
     """Check if input is a Google Cloud Storage URI."""
     return uri.startswith("gs://")
+
+
+def is_audio_input(input_str: str) -> bool:
+    """Return True if the input points to an audio file by its extension."""
+    if is_youtube_url(input_str) or is_files_api_ref(input_str):
+        return False
+    ext = Path(input_str).suffix.lower()
+    return ext in AUDIO_MIME_TYPES
 
 
 def is_files_api_ref(input_str: str) -> bool:
@@ -864,21 +896,39 @@ def get_video_duration_gcs(gcs_uri: str) -> str | None:
         return None
 
 
-def get_video_mime_type(file_path: Path) -> str:
-    """Get MIME type for a video file based on extension."""
+def get_media_mime_type(file_path: Path) -> tuple[str, MediaKind]:
+    """Get MIME type and media kind for a media file based on extension.
+
+    Returns:
+        Tuple of (mime_type, kind) where kind is "video" or "audio".
+    """
     ext = file_path.suffix.lower()
-    mime_type = VIDEO_MIME_TYPES.get(ext)
-    if not mime_type:
-        raise click.ClickException(
-            f"Unsupported video format: {ext}\n"
-            f"Supported formats: {', '.join(VIDEO_MIME_TYPES.keys())}"
-        )
-    return mime_type
+    video_mime = VIDEO_MIME_TYPES.get(ext)
+    if video_mime:
+        return video_mime, "video"
+    audio_mime = AUDIO_MIME_TYPES.get(ext)
+    if audio_mime:
+        return audio_mime, "audio"
+    raise click.ClickException(
+        f"Unsupported media format: {ext}\n"
+        f"Supported video formats: {', '.join(VIDEO_MIME_TYPES.keys())}\n"
+        f"Supported audio formats: {', '.join(AUDIO_MIME_TYPES.keys())}"
+    )
+
+
+def mime_type_for_extension(ext: str, default_kind: MediaKind = "video") -> str:
+    """Look up a MIME type by extension, falling back to a default for the given kind."""
+    ext = ext.lower()
+    if ext in VIDEO_MIME_TYPES:
+        return VIDEO_MIME_TYPES[ext]
+    if ext in AUDIO_MIME_TYPES:
+        return AUDIO_MIME_TYPES[ext]
+    return "video/mp4" if default_kind == "video" else "audio/mpeg"
 
 
 def _call_gemini_and_parse(
     client,
-    video_part,
+    media_part,
     model: str,
     prompt: str,
     analysis: VideoAnalysis,
@@ -893,7 +943,7 @@ def _call_gemini_and_parse(
 
     Args:
         client: Gemini API client.
-        video_part: The video Part object for the request.
+        media_part: The media Part object (video or audio) for the request.
         model: Model name.
         prompt: The analysis prompt text.
         analysis: VideoAnalysis object to populate.
@@ -914,7 +964,7 @@ def _call_gemini_and_parse(
         contents=[
             types.Content(
                 role="user",
-                parts=[video_part, types.Part(text=prompt)],
+                parts=[media_part, types.Part(text=prompt)],
             )
         ],
         config=config,
@@ -962,7 +1012,7 @@ def process_local_file(
     clip_end: str | None = None,
     media_resolution: str | None = None,
 ) -> VideoAnalysis:
-    """Process a local video file with Gemini API using Files API."""
+    """Process a local media file with Gemini API using Files API."""
     path = Path(file_path).resolve()
 
     analysis = VideoAnalysis(
@@ -972,7 +1022,7 @@ def process_local_file(
     )
 
     try:
-        mime_type = get_video_mime_type(path)
+        mime_type, kind = get_media_mime_type(path)
         file_size_mb = path.stat().st_size / (1024 * 1024)
 
         if verbose:
@@ -996,17 +1046,17 @@ def process_local_file(
         if uploaded_file.state.name == "FAILED":
             raise click.ClickException(f"File processing failed: {uploaded_file.name}")
 
-        # Generate content using the uploaded file
-        video_part = build_video_part(
+        media_part = build_media_part(
             uploaded_file.uri,
             mime_type,
+            kind=kind,
             fps=fps,
             clip_start=clip_start,
             clip_end=clip_end,
         )
         _call_gemini_and_parse(
             client,
-            video_part,
+            media_part,
             model,
             prompt,
             analysis,
@@ -1070,23 +1120,27 @@ def process_files_api_ref(
         if file_info.state.name == "FAILED":
             raise click.ClickException(f"File processing failed: {file_name}")
 
-        # Use MIME type from file metadata, fall back to video/mp4
-        mime_type = getattr(file_info, "mime_type", None) or "video/mp4"
+        display = getattr(file_info, "display_name", None) or file_name
+        ext = Path(display).suffix.lower()
+        # Use MIME type from file metadata, fall back based on file extension
+        fallback_mime = mime_type_for_extension(ext)
+        mime_type = getattr(file_info, "mime_type", None) or fallback_mime
+        kind: MediaKind = "audio" if mime_type.startswith("audio/") else "video"
 
         if verbose:
             click.echo(f"  Using file: {file_info.name} ({mime_type})", err=True)
 
-        video_part = build_video_part(
+        media_part = build_media_part(
             file_info.uri,
             mime_type,
+            kind=kind,
             fps=fps,
             clip_start=clip_start,
             clip_end=clip_end,
         )
-        display = getattr(file_info, "display_name", None) or file_name
         _call_gemini_and_parse(
             client,
-            video_part,
+            media_part,
             model,
             prompt,
             analysis,
@@ -1115,13 +1169,16 @@ def process_gcs_uri(
     clip_end: str | None = None,
     media_resolution: str | None = None,
 ) -> VideoAnalysis:
-    """Process a video from Google Cloud Storage with Gemini API."""
-    # Extract filename from GCS URI for display
+    """Process a media file from Google Cloud Storage with Gemini API."""
     filename = gcs_uri.split("/")[-1]
-
-    # Determine MIME type from extension
     ext = Path(filename).suffix.lower()
-    mime_type = VIDEO_MIME_TYPES.get(ext, "video/mp4")
+
+    if ext in AUDIO_MIME_TYPES:
+        mime_type = AUDIO_MIME_TYPES[ext]
+        kind: MediaKind = "audio"
+    else:
+        mime_type = VIDEO_MIME_TYPES.get(ext, "video/mp4")
+        kind = "video"
 
     analysis = VideoAnalysis(
         url=gcs_uri,
@@ -1133,16 +1190,17 @@ def process_gcs_uri(
         if verbose:
             click.echo(f"  Processing GCS file: {filename}", err=True)
 
-        video_part = build_video_part(
+        media_part = build_media_part(
             gcs_uri,
             mime_type,
+            kind=kind,
             fps=fps,
             clip_start=clip_start,
             clip_end=clip_end,
         )
         _call_gemini_and_parse(
             client,
-            video_part,
+            media_part,
             model,
             prompt,
             analysis,
@@ -1178,16 +1236,17 @@ def process_video(
     )
 
     try:
-        video_part = build_video_part(
+        media_part = build_media_part(
             normalized_url,
             "video/mp4",
+            kind="video",
             fps=fps,
             clip_start=clip_start,
             clip_end=clip_end,
         )
         _call_gemini_and_parse(
             client,
-            video_part,
+            media_part,
             model,
             prompt,
             analysis,
@@ -1678,7 +1737,7 @@ def _handle_upload_only(
         raise click.ClickException("--upload-only requires a local file path as input")
 
     path = Path(source).resolve()
-    mime_type = get_video_mime_type(path)
+    mime_type, _kind = get_media_mime_type(path)
     file_size_mb = path.stat().st_size / (1024 * 1024)
 
     click.echo(f"Uploading {path.name} ({file_size_mb:.1f} MB)...", err=True)
@@ -1988,8 +2047,10 @@ def main(
         yt-process files/abc123 --clip 0:00-10:00 --fps 0.5 --media-resolution low
 
     \b
-    Supported Video Formats:
-        .mp4, .mpeg, .mov, .avi, .webm, .wmv, .flv, .mkv, .3gp
+    Supported Media Formats:
+        Video: .mp4, .mpeg, .mov, .avi, .webm, .wmv, .flv, .mkv, .3gp
+        Audio: .mp3, .m4a, .wav, .flac, .ogg, .aac, .aiff, .aif
+        Note: --fps and --media-resolution apply to video only.
 
     \b
     Authentication:
@@ -2056,6 +2117,14 @@ def main(
 
     if upload_only and batch:
         raise click.ClickException("--upload-only cannot be used with --batch")
+
+    if input and is_audio_input(input):
+        if fps is not None:
+            raise click.ClickException("--fps is not supported for audio inputs")
+        if media_resolution is not None:
+            raise click.ClickException(
+                "--media-resolution is not supported for audio inputs"
+            )
 
     # Initialize client
     client = get_gemini_client(

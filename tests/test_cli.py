@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from youtube_gemini_processor.cli import (
+    AUDIO_MIME_TYPES,
     MEDIA_RESOLUTION_MAP,
     PROMPTS,
     SEGMENTS_SCHEMA,
@@ -18,15 +19,16 @@ from youtube_gemini_processor.cli import (
     VideoAnalysis,
     _sanitize_filename,
     build_generate_config,
-    build_video_part,
+    build_media_part,
     calculate_cost,
     extract_video_id,
     format_output_json,
     format_output_markdown,
     format_segments_json,
     format_segments_markdown,
+    get_media_mime_type,
     get_safe_filename,
-    get_video_mime_type,
+    is_audio_input,
     is_files_api_ref,
     is_local_file,
     is_youtube_url,
@@ -101,38 +103,38 @@ class TestIsYoutubeUrl:
         assert is_youtube_url("./video.mp4") is False
 
 
-class TestGetVideoMimeType:
-    """Tests for get_video_mime_type function."""
+class TestGetMediaMimeType:
+    """Tests for get_media_mime_type function."""
 
     def test_mp4_mime_type(self, tmp_path: Path) -> None:
         """Test MP4 files return correct MIME type."""
         test_file = tmp_path / "video.mp4"
-        assert get_video_mime_type(test_file) == "video/mp4"
+        assert get_media_mime_type(test_file) == ("video/mp4", "video")
 
     def test_mov_mime_type(self, tmp_path: Path) -> None:
         """Test MOV files return correct MIME type."""
         test_file = tmp_path / "video.mov"
-        assert get_video_mime_type(test_file) == "video/quicktime"
+        assert get_media_mime_type(test_file) == ("video/quicktime", "video")
 
     def test_webm_mime_type(self, tmp_path: Path) -> None:
         """Test WebM files return correct MIME type."""
         test_file = tmp_path / "video.webm"
-        assert get_video_mime_type(test_file) == "video/webm"
+        assert get_media_mime_type(test_file) == ("video/webm", "video")
 
     def test_avi_mime_type(self, tmp_path: Path) -> None:
         """Test AVI files return correct MIME type."""
         test_file = tmp_path / "video.avi"
-        assert get_video_mime_type(test_file) == "video/x-msvideo"
+        assert get_media_mime_type(test_file) == ("video/x-msvideo", "video")
 
     def test_mkv_mime_type(self, tmp_path: Path) -> None:
         """Test MKV files return correct MIME type."""
         test_file = tmp_path / "video.mkv"
-        assert get_video_mime_type(test_file) == "video/x-matroska"
+        assert get_media_mime_type(test_file) == ("video/x-matroska", "video")
 
     def test_case_insensitive(self, tmp_path: Path) -> None:
         """Test that extension matching is case-insensitive."""
         test_file = tmp_path / "video.MP4"
-        assert get_video_mime_type(test_file) == "video/mp4"
+        assert get_media_mime_type(test_file) == ("video/mp4", "video")
 
     def test_unsupported_format_raises_error(self, tmp_path: Path) -> None:
         """Test unsupported formats raise ClickException."""
@@ -140,15 +142,42 @@ class TestGetVideoMimeType:
 
         test_file = tmp_path / "video.xyz"
         with pytest.raises(click.ClickException) as exc_info:
-            get_video_mime_type(test_file)
-        assert "Unsupported video format" in str(exc_info.value)
+            get_media_mime_type(test_file)
+        assert "Unsupported media format" in str(exc_info.value)
         assert ".xyz" in str(exc_info.value)
 
-    def test_all_supported_formats(self, tmp_path: Path) -> None:
+    def test_all_supported_video_formats(self, tmp_path: Path) -> None:
         """Test all formats in VIDEO_MIME_TYPES are handled."""
         for ext, expected_mime in VIDEO_MIME_TYPES.items():
             test_file = tmp_path / f"video{ext}"
-            assert get_video_mime_type(test_file) == expected_mime
+            assert get_media_mime_type(test_file) == (expected_mime, "video")
+
+    def test_all_supported_audio_formats(self, tmp_path: Path) -> None:
+        """Test all formats in AUDIO_MIME_TYPES are handled."""
+        for ext, expected_mime in AUDIO_MIME_TYPES.items():
+            test_file = tmp_path / f"audio{ext}"
+            assert get_media_mime_type(test_file) == (expected_mime, "audio")
+
+    def test_mp3_mime_type(self, tmp_path: Path) -> None:
+        """Test MP3 files return correct MIME type and audio kind."""
+        test_file = tmp_path / "recording.mp3"
+        assert get_media_mime_type(test_file) == ("audio/mpeg", "audio")
+
+    def test_m4a_mime_type(self, tmp_path: Path) -> None:
+        """Test M4A files return correct MIME type and audio kind."""
+        test_file = tmp_path / "voice.m4a"
+        assert get_media_mime_type(test_file) == ("audio/mp4", "audio")
+
+    def test_error_lists_both_whitelists(self, tmp_path: Path) -> None:
+        """Error message for unsupported ext should mention video and audio."""
+        import click
+
+        test_file = tmp_path / "file.xyz"
+        with pytest.raises(click.ClickException) as exc_info:
+            get_media_mime_type(test_file)
+        msg = str(exc_info.value)
+        assert "video" in msg.lower()
+        assert "audio" in msg.lower()
 
 
 class TestValidateYoutubeUrl:
@@ -1490,13 +1519,13 @@ class TestParseClipRange:
         assert end == "60s"
 
 
-class TestBuildVideoPart:
-    """Tests for build_video_part function."""
+class TestBuildMediaPart:
+    """Tests for build_media_part function."""
 
     @patch("google.genai.types")
     def test_basic_part_no_metadata(self, mock_types: MagicMock) -> None:
         """Test building a part with no video metadata."""
-        build_video_part("https://example.com/video", "video/mp4")
+        build_media_part("https://example.com/video", "video/mp4")
 
         mock_types.FileData.assert_called_once_with(
             file_uri="https://example.com/video", mime_type="video/mp4"
@@ -1509,7 +1538,7 @@ class TestBuildVideoPart:
     @patch("google.genai.types")
     def test_part_with_fps(self, mock_types: MagicMock) -> None:
         """Test building a part with custom FPS."""
-        build_video_part("https://example.com/video", "video/mp4", fps=2.0)
+        build_media_part("https://example.com/video", "video/mp4", fps=2.0)
 
         mock_types.VideoMetadata.assert_called_once_with(fps=2.0)
         call_kwargs = mock_types.Part.call_args[1]
@@ -1518,7 +1547,7 @@ class TestBuildVideoPart:
     @patch("google.genai.types")
     def test_part_with_clip(self, mock_types: MagicMock) -> None:
         """Test building a part with clip offsets."""
-        build_video_part(
+        build_media_part(
             "https://example.com/video",
             "video/mp4",
             clip_start="90s",
@@ -1532,7 +1561,7 @@ class TestBuildVideoPart:
     @patch("google.genai.types")
     def test_part_with_all_options(self, mock_types: MagicMock) -> None:
         """Test building a part with all video metadata options."""
-        build_video_part(
+        build_media_part(
             "https://example.com/video",
             "video/mp4",
             fps=0.5,
@@ -1542,6 +1571,41 @@ class TestBuildVideoPart:
 
         mock_types.VideoMetadata.assert_called_once_with(
             fps=0.5, start_offset="0s", end_offset="600s"
+        )
+
+    @patch("google.genai.types")
+    def test_audio_part_skips_video_metadata(self, mock_types: MagicMock) -> None:
+        """Audio parts should not attach VideoMetadata (no fps)."""
+        build_media_part("gs://bucket/recording.mp3", "audio/mpeg", kind="audio")
+
+        mock_types.VideoMetadata.assert_not_called()
+        call_kwargs = mock_types.Part.call_args[1]
+        assert "video_metadata" not in call_kwargs
+
+    @patch("google.genai.types")
+    def test_audio_part_ignores_fps(self, mock_types: MagicMock) -> None:
+        """Audio parts should not attach VideoMetadata even if fps is passed."""
+        build_media_part(
+            "gs://bucket/recording.mp3", "audio/mpeg", kind="audio", fps=2.0
+        )
+
+        mock_types.VideoMetadata.assert_not_called()
+        call_kwargs = mock_types.Part.call_args[1]
+        assert "video_metadata" not in call_kwargs
+
+    @patch("google.genai.types")
+    def test_audio_part_honors_clip(self, mock_types: MagicMock) -> None:
+        """Audio parts should still attach start/end offsets via VideoMetadata."""
+        build_media_part(
+            "gs://bucket/recording.mp3",
+            "audio/mpeg",
+            kind="audio",
+            clip_start="30s",
+            clip_end="90s",
+        )
+
+        mock_types.VideoMetadata.assert_called_once_with(
+            start_offset="30s", end_offset="90s"
         )
 
 
@@ -1770,3 +1834,84 @@ class TestCLIVideoProcessingOptions:
             not hasattr(video_part, "video_metadata")
             or video_part.video_metadata is None
         )
+
+
+class TestIsAudioInput:
+    """Tests for is_audio_input helper."""
+
+    def test_mp3_path(self) -> None:
+        assert is_audio_input("recording.mp3") is True
+
+    def test_m4a_gcs_uri(self) -> None:
+        assert is_audio_input("gs://bucket/voice.m4a") is True
+
+    def test_uppercase_extension(self) -> None:
+        assert is_audio_input("Meeting.WAV") is True
+
+    def test_video_path(self) -> None:
+        assert is_audio_input("video.mp4") is False
+
+    def test_youtube_url_is_not_audio(self) -> None:
+        assert is_audio_input("https://www.youtube.com/watch?v=abc123") is False
+
+    def test_files_api_ref_is_not_audio(self) -> None:
+        assert is_audio_input("files/abc123") is False
+
+    def test_unknown_extension(self) -> None:
+        assert is_audio_input("mystery.xyz") is False
+
+
+class TestCLIAudioRestrictions:
+    """Tests that audio inputs reject video-only options."""
+
+    def test_fps_rejected_for_audio_local(self, tmp_path: Path) -> None:
+        audio = tmp_path / "voice.mp3"
+        audio.write_bytes(b"fake")
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                str(audio),
+                "--api-key",
+                "fake-key",
+                "--fps",
+                "2.0",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--fps" in result.output
+        assert "audio" in result.output.lower()
+
+    def test_fps_rejected_for_audio_gcs(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "gs://bucket/recording.mp3",
+                "--vertex",
+                "--project",
+                "test-project",
+                "--fps",
+                "1.5",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--fps" in result.output
+
+    def test_media_resolution_rejected_for_audio(self, tmp_path: Path) -> None:
+        audio = tmp_path / "voice.mp3"
+        audio.write_bytes(b"fake")
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                str(audio),
+                "--api-key",
+                "fake-key",
+                "--media-resolution",
+                "low",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--media-resolution" in result.output
+        assert "audio" in result.output.lower()

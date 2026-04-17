@@ -46,7 +46,8 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 | `process_files_api_ref()` | Process using existing Files API reference (no upload) |
 | `parse_timestamp_to_seconds()` | Parse SS, MM:SS, HH:MM:SS to `"{seconds}s"` |
 | `parse_clip_range()` | Parse `"START-END"` clip range string |
-| `build_video_part()` | Build video Part with optional VideoMetadata (fps, clip) |
+| `get_media_mime_type()` | Resolve MIME type and kind (`video`/`audio`) for a media file |
+| `build_media_part()` | Build media Part; VideoMetadata attached only for video (or audio clip offsets) |
 | `build_generate_config()` | Build GenerateContentConfig with optional media resolution |
 | `_call_gemini_and_parse()` | Shared helper: call Gemini API and populate VideoAnalysis |
 | `_format_duration()` | Format seconds as HH:MM:SS |
@@ -60,12 +61,15 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 
 ## Input Types
 
-- **YouTube URLs** - Passed directly to Gemini via `file_uri`
+- **YouTube URLs** - Passed directly to Gemini via `file_uri` (video only)
 - **Local files** - Uploaded via Gemini Files API, then processed (API key only, not Vertex AI)
 - **Files API references** - `files/abc123` references to previously uploaded files (reuse for 48h)
 - **GCS URIs** - `gs://` paths processed directly via Vertex AI
 
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
+Supported audio formats: `.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.aac`, `.aiff`, `.aif`
+
+`--fps` and `--media-resolution` are video-only and error out if combined with audio input. `--clip` works for both.
 
 ### Files API Reuse
 

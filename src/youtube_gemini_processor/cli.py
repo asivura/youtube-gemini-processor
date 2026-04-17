@@ -312,6 +312,7 @@ PROMPTS = {
 MODEL_PRICING = {
     "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},  # Per 1M tokens
     "gemini-3-pro-preview": {"input": 1.25, "output": 10.00},
+    "gemini-3.1-pro-preview": {"input": 1.25, "output": 10.00},
     "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
     "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
@@ -321,6 +322,7 @@ MODEL_PRICING = {
 MODEL_MAX_OUTPUT_TOKENS = {
     "gemini-3-flash-preview": 65536,
     "gemini-3-pro-preview": 65536,
+    "gemini-3.1-pro-preview": 65536,
     "gemini-2.5-flash": 65536,
     "gemini-2.5-pro": 65536,
     "gemini-2.0-flash": 8192,

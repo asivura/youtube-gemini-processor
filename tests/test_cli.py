@@ -311,6 +311,41 @@ class TestCalculateCost:
         assert stats.total_tokens == 0
         assert stats.total_cost == 0.0
 
+    def test_gemini_3_1_pro_pricing(self) -> None:
+        """Test cost calculation for gemini-3.1-pro-preview."""
+        stats = calculate_cost("gemini-3.1-pro-preview", 1_000_000, 100_000)
+        assert stats.input_cost == pytest.approx(1.25)
+        assert stats.output_cost == pytest.approx(1.00)
+        assert stats.total_cost == pytest.approx(2.25)
+
+
+class TestModelChoices:
+    """Tests for supported --model choices."""
+
+    def test_gemini_3_1_pro_is_valid_choice(self) -> None:
+        """Test that gemini-3.1-pro-preview is accepted by --model."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["--help"])
+        assert result.exit_code == 0
+        assert "gemini-3.1-pro-preview" in result.output
+
+    def test_gemini_3_1_pro_not_rejected_as_invalid_choice(self) -> None:
+        """Test that --model gemini-3.1-pro-preview passes Click's choice check."""
+        runner = CliRunner()
+        # Missing --api-key/--vertex is fine for this check: we only care that
+        # Click's Choice does not fail first. An invalid choice would exit with
+        # "Invalid value for '--model'" before any auth logic runs.
+        result = runner.invoke(
+            main,
+            [
+                "--model",
+                "gemini-3.1-pro-preview",
+                "--help",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Invalid value for '--model'" not in result.output
+
 
 class TestFormatOutputMarkdown:
     """Tests for format_output_markdown function."""

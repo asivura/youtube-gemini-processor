@@ -181,7 +181,7 @@ Four hardcoded prompts in `cli.py`:
 
 The `--mode segments` option uses Gemini to identify logical sections of a video. It returns structured JSON with segment boundaries. Use `--split` to also split the video into separate files via ffmpeg.
 
-**Recommended model**: Use `gemini-3.1-pro-preview` (the default) for segmentation. Smaller models (`gemini-3-flash-preview`, `gemini-2.5-flash`) tend to truncate and only cover the first portion of long videos. The tool auto-detects video duration via ffprobe and injects it into the prompt, but only Pro-tier models reliably cover the full video.
+**Recommended model**: Use `gemini-3.1-pro-preview` (the default) for segmentation. Smaller models (`gemini-3-flash-preview`, `gemini-3.1-flash-lite`) tend to truncate and only cover the first portion of long videos. The tool auto-detects video duration via ffprobe and injects it into the prompt, but only Pro-tier models reliably cover the full video.
 
 ```bash
 # Identify segments (uses default gemini-3.1-pro-preview for reliable full-video coverage)

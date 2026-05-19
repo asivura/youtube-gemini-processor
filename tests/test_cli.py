@@ -291,9 +291,9 @@ class TestCalculateCost:
         )  # $3.00 per 1M output tokens * 0.1M
         assert stats.total_cost == pytest.approx(0.80)
 
-    def test_gemini_2_flash_pricing(self) -> None:
-        """Test cost calculation for gemini-2.0-flash."""
-        stats = calculate_cost("gemini-2.0-flash", 1_000_000, 1_000_000)
+    def test_gemini_flash_lite_pricing(self) -> None:
+        """Test cost calculation for gemini-2.5-flash-lite."""
+        stats = calculate_cost("gemini-2.5-flash-lite", 1_000_000, 1_000_000)
         assert stats.input_cost == 0.10  # $0.10 per 1M input tokens
         assert stats.output_cost == 0.40  # $0.40 per 1M output tokens
         assert stats.total_cost == 0.50
@@ -301,9 +301,9 @@ class TestCalculateCost:
     def test_unknown_model_uses_default(self) -> None:
         """Test unknown models use default pricing."""
         stats = calculate_cost("unknown-model", 1_000_000, 100_000)
-        # Should use gemini-3.1-pro-preview pricing as default
-        assert stats.input_cost == pytest.approx(1.25)
-        assert stats.output_cost == pytest.approx(1.00)
+        # Should use gemini-3.1-pro-preview pricing as default ($2.00/$12.00)
+        assert stats.input_cost == pytest.approx(2.00)
+        assert stats.output_cost == pytest.approx(1.20)
 
     def test_zero_tokens(self) -> None:
         """Test zero token counts."""
@@ -314,9 +314,9 @@ class TestCalculateCost:
     def test_gemini_3_1_pro_pricing(self) -> None:
         """Test cost calculation for gemini-3.1-pro-preview."""
         stats = calculate_cost("gemini-3.1-pro-preview", 1_000_000, 100_000)
-        assert stats.input_cost == pytest.approx(1.25)
-        assert stats.output_cost == pytest.approx(1.00)
-        assert stats.total_cost == pytest.approx(2.25)
+        assert stats.input_cost == pytest.approx(2.00)
+        assert stats.output_cost == pytest.approx(1.20)
+        assert stats.total_cost == pytest.approx(3.20)
 
 
 class TestPromptDurationLine:
@@ -1678,7 +1678,7 @@ class TestBuildGenerateConfig:
     @patch("youtube_gemini_processor.cli.get_max_output_tokens", return_value=8192)
     def test_basic_config(self, mock_tokens: MagicMock, mock_types: MagicMock) -> None:
         """Test basic config without media resolution."""
-        build_generate_config("gemini-2.5-flash")
+        build_generate_config("gemini-2.5-flash-lite")
 
         call_kwargs = mock_types.GenerateContentConfig.call_args[1]
         assert call_kwargs["max_output_tokens"] == 8192
@@ -1691,7 +1691,7 @@ class TestBuildGenerateConfig:
     ) -> None:
         """Test config with media resolution."""
         build_generate_config(
-            "gemini-2.5-flash", media_resolution="MEDIA_RESOLUTION_LOW"
+            "gemini-2.5-flash-lite", media_resolution="MEDIA_RESOLUTION_LOW"
         )
 
         call_kwargs = mock_types.GenerateContentConfig.call_args[1]
@@ -1704,7 +1704,7 @@ class TestBuildGenerateConfig:
     ) -> None:
         """Test config with response schema."""
         schema = {"type": "object"}
-        build_generate_config("gemini-2.5-flash", response_schema=schema)
+        build_generate_config("gemini-2.5-flash-lite", response_schema=schema)
 
         call_kwargs = mock_types.GenerateContentConfig.call_args[1]
         assert call_kwargs["response_mime_type"] == "application/json"

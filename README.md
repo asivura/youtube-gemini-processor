@@ -223,13 +223,19 @@ yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --prompt "List all tools, 
 ### Model Selection
 
 ```bash
-yt-process "./video.mp4" --model gemini-3.1-pro-preview   # Default, best quality
-yt-process "./video.mp4" --model gemini-3-pro-preview     # Previous 3 Pro revision
-yt-process "./video.mp4" --model gemini-3-flash-preview   # Faster, lower cost
-yt-process "./video.mp4" --model gemini-2.5-pro           # Previous gen, high quality
-yt-process "./video.mp4" --model gemini-2.5-flash         # Previous gen, fast
-yt-process "./video.mp4" --model gemini-2.0-flash         # Oldest supported
+yt-process "./video.mp4" --model gemini-3.1-pro-preview   # Default, best quality (preview)
+yt-process "./video.mp4" --model gemini-3-flash-preview   # Faster, lower cost (preview)
+yt-process "./video.mp4" --model gemini-3.1-flash-lite    # GA, cheapest 3.x tier
+yt-process "./video.mp4" --model gemini-2.5-flash-lite    # GA, cheapest 2.5 tier
 ```
+
+**Migration note (May 2026)** — scripts pinned to a removed model should switch to:
+
+- `gemini-2.5-flash` → `gemini-2.5-flash-lite`
+- `gemini-2.5-pro` or `gemini-3-pro-preview` → `gemini-3.1-pro-preview`
+- `gemini-2.0-flash` → `gemini-3.1-flash-lite`
+
+**Cost-reporting caveat for `gemini-3.1-pro-preview`** — Google charges a tiered rate ($2/$12 per 1M tokens for inputs <=200k, $4/$18 above). The cost printed at the end of each run uses only the <=200k tier, so it under-reports by ~7-15% for inputs that cross 200k tokens (multi-hour videos at default settings). To stay below the threshold, use `--media-resolution low` or lower `--fps`.
 
 ### Video Processing Options
 
@@ -324,7 +330,7 @@ Options:
   -m, --mode [comprehensive|concise|transcript|segments]
                                   Analysis mode (default: comprehensive)
   -p, --prompt TEXT               Custom prompt (overrides --mode)
-  --model [gemini-3-pro-preview|gemini-3.1-pro-preview|gemini-3-flash-preview|gemini-2.5-pro|gemini-2.5-flash|gemini-2.0-flash]
+  --model [gemini-3.1-pro-preview|gemini-3-flash-preview|gemini-3.1-flash-lite|gemini-2.5-flash-lite]
                                   Gemini model (default: gemini-3.1-pro-preview)
   --api-key TEXT                  Gemini API key (or set GEMINI_API_KEY)
   --vertex                       Use Vertex AI authentication

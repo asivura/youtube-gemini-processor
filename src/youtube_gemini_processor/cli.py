@@ -308,16 +308,19 @@ PROMPTS = {
 }
 
 # Pricing per 1M tokens (https://ai.google.dev/gemini-api/docs/pricing).
-# Note: gemini-3.1-pro-preview uses a tiered structure — $2/$12 for inputs
-# <=200k tokens, $4/$18 above. This dict stores only the <=200k tier, so
-# calculate_cost() will under-report by ~7-15% for inputs that cross the
-# 200k threshold (multi-hour videos at default settings). To stay below
-# 200k, use --media-resolution low or lower --fps.
+# Each "input"/"output" entry is either a flat float (per-1M-token rate, used
+# by models with a single tier) or a list of (upper_bound, price) tuples for
+# tiered pricing. Tokens are billed proportionally: tokens in the range
+# [previous_bound, upper_bound) are charged at `price`, and the final tuple
+# must use `None` as upper_bound to cover everything above the last tier.
+# For example, gemini-3.1-pro-preview charges $2/$12 per 1M tokens for the
+# first 200k tokens and $4/$18 above that — captured here as tier tables so
+# calculate_cost() reports the actual billed amount for long-context runs.
 MODEL_PRICING = {
     "gemini-3.1-pro-preview": {
-        "input": 2.00,
-        "output": 12.00,
-    },  # Per 1M tokens, <=200k context tier
+        "input": [(200_000, 2.00), (None, 4.00)],
+        "output": [(200_000, 12.00), (None, 18.00)],
+    },
     "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},
     "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
     "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
@@ -362,13 +365,36 @@ SEGMENTS_SCHEMA = {
 }
 
 
+def _tier_cost(
+    tiers: float | int | list[tuple[int | None, float]], tokens: int
+) -> float:
+    """Compute cost for `tokens` against a flat rate or a tier table.
+
+    A flat rate is a single per-1M-token price. A tier table is a list of
+    (upper_bound, price) tuples — tokens within [prev_bound, upper_bound)
+    are billed at `price`, and the final tuple must have `upper_bound=None`
+    so it absorbs any tokens above the last threshold.
+    """
+    if isinstance(tiers, (int, float)):
+        return (tokens / 1_000_000) * tiers
+
+    cost = 0.0
+    prev_bound = 0
+    for upper, price in tiers:
+        if upper is None or tokens <= upper:
+            cost += ((tokens - prev_bound) / 1_000_000) * price
+            return cost
+        cost += ((upper - prev_bound) / 1_000_000) * price
+        prev_bound = upper
+    return cost
+
+
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageStats:
     """Calculate usage cost based on model and token counts."""
     pricing = MODEL_PRICING.get(model, MODEL_PRICING["gemini-3.1-pro-preview"])
 
-    # Convert to cost (pricing is per 1M tokens)
-    input_cost = (input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    input_cost = _tier_cost(pricing["input"], input_tokens)
+    output_cost = _tier_cost(pricing["output"], output_tokens)
 
     return UsageStats(
         input_tokens=input_tokens,

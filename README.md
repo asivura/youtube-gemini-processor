@@ -226,8 +226,6 @@ yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --prompt "List all tools, 
 yt-process "./video.mp4" --model gemini-3.1-pro-preview   # Default, best quality (preview)
 yt-process "./video.mp4" --model gemini-3-flash-preview   # Faster, lower cost (preview)
 yt-process "./video.mp4" --model gemini-3.1-flash-lite    # GA, cheapest 3.x tier
-yt-process "./video.mp4" --model gemini-2.5-pro           # GA, high quality
-yt-process "./video.mp4" --model gemini-2.5-flash         # GA, fast
 yt-process "./video.mp4" --model gemini-2.5-flash-lite    # GA, cheapest 2.5 tier
 ```
 
@@ -324,7 +322,7 @@ Options:
   -m, --mode [comprehensive|concise|transcript|segments]
                                   Analysis mode (default: comprehensive)
   -p, --prompt TEXT               Custom prompt (overrides --mode)
-  --model [gemini-3.1-pro-preview|gemini-3-flash-preview|gemini-3.1-flash-lite|gemini-2.5-pro|gemini-2.5-flash|gemini-2.5-flash-lite]
+  --model [gemini-3.1-pro-preview|gemini-3-flash-preview|gemini-3.1-flash-lite|gemini-2.5-flash-lite]
                                   Gemini model (default: gemini-3.1-pro-preview)
   --api-key TEXT                  Gemini API key (or set GEMINI_API_KEY)
   --vertex                       Use Vertex AI authentication

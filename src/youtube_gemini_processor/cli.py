@@ -307,8 +307,12 @@ PROMPTS = {
     "segments": SEGMENTS_PROMPT,
 }
 
-# Pricing per 1M tokens
-# https://ai.google.dev/pricing
+# Pricing per 1M tokens (https://ai.google.dev/gemini-api/docs/pricing).
+# Note: gemini-3.1-pro-preview uses a tiered structure — $2/$12 for inputs
+# <=200k tokens, $4/$18 above. This dict stores only the <=200k tier, so
+# calculate_cost() will under-report by ~7-15% for inputs that cross the
+# 200k threshold (multi-hour videos at default settings). To stay below
+# 200k, use --media-resolution low or lower --fps.
 MODEL_PRICING = {
     "gemini-3.1-pro-preview": {
         "input": 2.00,

@@ -229,6 +229,14 @@ yt-process "./video.mp4" --model gemini-3.1-flash-lite    # GA, cheapest 3.x tie
 yt-process "./video.mp4" --model gemini-2.5-flash-lite    # GA, cheapest 2.5 tier
 ```
 
+**Migration note (May 2026)** — scripts pinned to a removed model should switch to:
+
+- `gemini-2.5-flash` → `gemini-2.5-flash-lite`
+- `gemini-2.5-pro` or `gemini-3-pro-preview` → `gemini-3.1-pro-preview`
+- `gemini-2.0-flash` → `gemini-3.1-flash-lite`
+
+**Cost-reporting caveat for `gemini-3.1-pro-preview`** — Google charges a tiered rate ($2/$12 per 1M tokens for inputs <=200k, $4/$18 above). The cost printed at the end of each run uses only the <=200k tier, so it under-reports by ~7-15% for inputs that cross 200k tokens (multi-hour videos at default settings). To stay below the threshold, use `--media-resolution low` or lower `--fps`.
+
 ### Video Processing Options
 
 #### Frame Rate (`--fps`)

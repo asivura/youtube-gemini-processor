@@ -87,18 +87,21 @@ class TestGetGeminiClient:
             get_gemini_client(use_vertex=True)
 
     @patch("google.genai.Client")
-    def test_vertex_env_auto_detect(self, mock_client_cls: MagicMock) -> None:
-        with patch.dict(
-            "os.environ",
-            {
-                "GOOGLE_GENAI_USE_VERTEXAI": "true",
-                "GOOGLE_CLOUD_PROJECT": "env-proj",
-            },
+    def test_vertex_env_auto_detect(
+        self, mock_client_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for var in (
+            "YT_PROCESS_PROJECT",
+            "GCP_PROJECT",
+            "CLOUDSDK_CORE_PROJECT",
         ):
-            get_gemini_client()
-            call_kwargs = mock_client_cls.call_args[1]
-            assert call_kwargs["vertexai"] is True
-            assert call_kwargs["project"] == "env-proj"
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "env-proj")
+        get_gemini_client()
+        call_kwargs = mock_client_cls.call_args[1]
+        assert call_kwargs["vertexai"] is True
+        assert call_kwargs["project"] == "env-proj"
 
     @patch("google.genai.Client")
     @patch.dict(

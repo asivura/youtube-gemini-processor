@@ -299,10 +299,12 @@ class TestCalculateCost:
         assert stats.total_cost == 0.50
 
     def test_unknown_model_uses_default(self) -> None:
-        """Test unknown models use default pricing."""
+        """Test unknown models use default pricing (gemini-3.1-pro-preview tiers)."""
+        # 1M input crosses the 200k tier boundary on the default model.
         stats = calculate_cost("unknown-model", 1_000_000, 100_000)
-        # Should use gemini-3.1-pro-preview pricing as default ($2.00/$12.00)
-        assert stats.input_cost == pytest.approx(2.00)
+        # input: 200k * $2/M + 800k * $4/M = $0.40 + $3.20 = $3.60
+        assert stats.input_cost == pytest.approx(3.60)
+        # output 100k stays in the first tier ($12/M).
         assert stats.output_cost == pytest.approx(1.20)
 
     def test_zero_tokens(self) -> None:
@@ -311,12 +313,34 @@ class TestCalculateCost:
         assert stats.total_tokens == 0
         assert stats.total_cost == 0.0
 
-    def test_gemini_3_1_pro_pricing(self) -> None:
-        """Test cost calculation for gemini-3.1-pro-preview."""
-        stats = calculate_cost("gemini-3.1-pro-preview", 1_000_000, 100_000)
-        assert stats.input_cost == pytest.approx(2.00)
-        assert stats.output_cost == pytest.approx(1.20)
-        assert stats.total_cost == pytest.approx(3.20)
+    def test_gemini_3_1_pro_pricing_below_threshold(self) -> None:
+        """Sub-200k input on the tiered model uses only the cheap tier."""
+        stats = calculate_cost("gemini-3.1-pro-preview", 150_000, 50_000)
+        # input: 150k * $2/M = $0.30
+        assert stats.input_cost == pytest.approx(0.30)
+        # output: 50k * $12/M = $0.60
+        assert stats.output_cost == pytest.approx(0.60)
+        assert stats.total_cost == pytest.approx(0.90)
+
+    def test_gemini_3_1_pro_pricing_crosses_tier(self) -> None:
+        """Above-200k input bills the two tiers proportionally."""
+        stats = calculate_cost("gemini-3.1-pro-preview", 300_000, 250_000)
+        # input: 200k * $2/M + 100k * $4/M = $0.40 + $0.40 = $0.80
+        assert stats.input_cost == pytest.approx(0.80)
+        # output: 200k * $12/M + 50k * $18/M = $2.40 + $0.90 = $3.30
+        assert stats.output_cost == pytest.approx(3.30)
+        assert stats.total_cost == pytest.approx(4.10)
+
+    def test_flat_tier_model_unchanged(self) -> None:
+        """Models with a flat (single-tier) rate still bill linearly."""
+        # gemini-3-flash-preview has no tier table — $0.50/$3.00 per 1M flat.
+        stats = calculate_cost("gemini-3-flash-preview", 500_000, 200_000)
+        assert stats.input_cost == pytest.approx(0.25)
+        assert stats.output_cost == pytest.approx(0.60)
+        assert stats.total_cost == pytest.approx(0.85)
+        # And well above any hypothetical 200k threshold the cost stays linear.
+        big = calculate_cost("gemini-3-flash-preview", 1_500_000, 0)
+        assert big.input_cost == pytest.approx(0.75)
 
 
 class TestPromptDurationLine:

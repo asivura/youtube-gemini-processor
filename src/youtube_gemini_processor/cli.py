@@ -310,22 +310,25 @@ PROMPTS = {
 # Pricing per 1M tokens
 # https://ai.google.dev/pricing
 MODEL_PRICING = {
-    "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},  # Per 1M tokens
-    "gemini-3-pro-preview": {"input": 1.25, "output": 10.00},
-    "gemini-3.1-pro-preview": {"input": 1.25, "output": 10.00},
-    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
+    "gemini-3.1-pro-preview": {
+        "input": 2.00,
+        "output": 12.00,
+    },  # Per 1M tokens, <=200k context tier
+    "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},
+    "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
     "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
-    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
 }
 
 # Maximum output tokens per model
 MODEL_MAX_OUTPUT_TOKENS = {
-    "gemini-3-flash-preview": 65536,
-    "gemini-3-pro-preview": 65536,
     "gemini-3.1-pro-preview": 65536,
-    "gemini-2.5-flash": 65536,
+    "gemini-3-flash-preview": 65536,
+    "gemini-3.1-flash-lite": 65536,
     "gemini-2.5-pro": 65536,
-    "gemini-2.0-flash": 8192,
+    "gemini-2.5-flash": 65536,
+    "gemini-2.5-flash-lite": 65536,
 }
 
 
@@ -1077,7 +1080,7 @@ def process_files_api_ref(
     client,
     file_ref: str,
     prompt: str,
-    model: str = "gemini-3-pro-preview",
+    model: str = "gemini-3.1-pro-preview",
     verbose: bool = False,
     response_schema: dict | None = None,
     fps: float | None = None,

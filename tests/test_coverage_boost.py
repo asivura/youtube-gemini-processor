@@ -94,6 +94,9 @@ class TestGetGeminiClient:
             "YT_PROCESS_PROJECT",
             "GCP_PROJECT",
             "CLOUDSDK_CORE_PROJECT",
+            "YT_PROCESS_LOCATION",
+            "GOOGLE_CLOUD_LOCATION",
+            "CLOUDSDK_COMPUTE_REGION",
         ):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")

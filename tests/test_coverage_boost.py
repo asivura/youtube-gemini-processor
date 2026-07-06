@@ -25,6 +25,7 @@ from youtube_gemini_processor.cli import (
     _format_duration,
     _gemini_schema_to_json_schema,
     _handle_output,
+    _inline_data_to_openai_part,
     _normalize_timestamp_to_hhmmss,
     _process_single_chapter,
     build_generate_config,
@@ -472,6 +473,58 @@ class TestProcessLocalFile:
         mock_client.models.generate_content.return_value = mock_response
 
         analysis = process_local_file(mock_client, str(video), "Analyze", verbose=True)
+        assert analysis.error is None
+
+    def test_litellm_audio_sent_inline(self, tmp_path: Path) -> None:
+        """LiteLLM backend reads audio bytes and sends them inline (no upload)."""
+        audio = tmp_path / "clip.mp3"
+        audio.write_bytes(b"\x00\x01\x02")
+
+        client = LiteLLMClient(base_url="https://gw/v1", api_key="sk-test")
+        client.http = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "transcript"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }
+        client.http.post.return_value = resp
+
+        analysis = process_local_file(
+            client, str(audio), "Transcribe", model="gemini-2.5-pro", verbose=True
+        )
+        assert analysis.error is None
+        assert analysis.raw_response == "transcript"
+        # No Files API upload attempted, and audio went inline.
+        payload = client.http.post.call_args.kwargs["json"]
+        blocks = payload["messages"][0]["content"]
+        audio_block = next(b for b in blocks if b["type"] == "input_audio")
+        assert audio_block["input_audio"]["format"] == "mp3"
+        assert audio_block["input_audio"]["data"] == "AAEC"
+
+    def test_litellm_warns_on_fps_clip(self, tmp_path: Path) -> None:
+        """--fps/--clip warn and are ignored on the LiteLLM inline path."""
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\x00\x01\x02")
+
+        client = LiteLLMClient(base_url="https://gw/v1", api_key="sk-test")
+        client.http = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }
+        client.http.post.return_value = resp
+
+        analysis = process_local_file(
+            client,
+            str(video),
+            "Analyze",
+            model="gemini-2.5-pro",
+            fps=2.0,
+            clip_start="10s",
+        )
         assert analysis.error is None
 
 
@@ -1651,6 +1704,60 @@ class TestLiteLLMRequestTranslation:
             == "Bearer sk-test"
         )
 
+    def test_inline_audio_becomes_input_audio_block(self) -> None:
+        from google.genai import types
+
+        client = self._client()
+        client.http = MagicMock()
+        client.http.post.return_value = self._mock_http_response()
+
+        audio_part = types.Part(
+            inline_data=types.Blob(data=b"\x00\x01\x02", mime_type="audio/mpeg")
+        )
+        config = build_generate_config("gemini-2.5-pro")
+        client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[audio_part, types.Part(text="transcribe")],
+                )
+            ],
+            config=config,
+        )
+        payload = client.http.post.call_args.kwargs["json"]
+        blocks = payload["messages"][0]["content"]
+        audio_block = next(b for b in blocks if b["type"] == "input_audio")
+        assert audio_block["input_audio"]["format"] == "mp3"
+        # Base64 of b"\x00\x01\x02"
+        assert audio_block["input_audio"]["data"] == "AAEC"
+
+    def test_inline_video_becomes_data_url_file_block(self) -> None:
+        from google.genai import types
+
+        client = self._client()
+        client.http = MagicMock()
+        client.http.post.return_value = self._mock_http_response()
+
+        video_part = types.Part(
+            inline_data=types.Blob(data=b"\x00\x01\x02", mime_type="video/mp4")
+        )
+        config = build_generate_config("gemini-2.5-pro")
+        client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[video_part, types.Part(text="describe")],
+                )
+            ],
+            config=config,
+        )
+        payload = client.http.post.call_args.kwargs["json"]
+        blocks = payload["messages"][0]["content"]
+        file_block = next(b for b in blocks if b["type"] == "file")
+        assert file_block["file"]["file_data"] == "data:video/mp4;base64,AAEC"
+
     def test_response_schema_becomes_json_schema(self) -> None:
         from google.genai import types
 
@@ -1698,6 +1805,23 @@ class TestLiteLLMRequestTranslation:
         captured = capsys.readouterr()
         assert "ignored on the LiteLLM backend" in captured.err
 
+    def test_inline_data_part_helper_audio_and_video(self) -> None:
+        """_inline_data_to_openai_part maps audio and video shapes correctly."""
+        audio = _inline_data_to_openai_part(b"\x00\x01\x02", "audio/x-m4a")
+        assert audio == {
+            "type": "input_audio",
+            "input_audio": {"data": "AAEC", "format": "m4a"},
+        }
+        # Unknown audio subtype falls back to the mime subtype.
+        weird = _inline_data_to_openai_part(b"\x00", "audio/weird")
+        assert weird["input_audio"]["format"] == "weird"
+
+        video = _inline_data_to_openai_part(b"\x00\x01\x02", "video/webm")
+        assert video == {
+            "type": "file",
+            "file": {"file_data": "data:video/webm;base64,AAEC"},
+        }
+
     def test_non_200_raises(self) -> None:
         from google.genai import types
 
@@ -1723,21 +1847,36 @@ class TestLiteLLMRequestTranslation:
 class TestLiteLLMGuards:
     """Tests that unsupported operations are guarded on the LiteLLM backend."""
 
+    @patch("youtube_gemini_processor.cli.get_video_duration", return_value=None)
     @patch("youtube_gemini_processor.cli.get_gemini_client")
-    def test_local_file_rejected(
-        self, mock_get_client: MagicMock, tmp_path: Path
+    def test_local_file_allowed_inline(
+        self,
+        mock_get_client: MagicMock,
+        _mock_duration: MagicMock,
+        tmp_path: Path,
     ) -> None:
-        mock_get_client.return_value = LiteLLMClient(
-            base_url="https://gw/v1", api_key="sk-test"
-        )
+        """Local files are sent inline over LiteLLM (no longer rejected)."""
+        client = LiteLLMClient(base_url="https://gw/v1", api_key="sk-test")
+        client.http = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "transcript"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        client.http.post.return_value = resp
+        mock_get_client.return_value = client
+
         video = tmp_path / "clip.mp4"
         video.write_bytes(b"data")
         runner = CliRunner()
         result = runner.invoke(main, [str(video), "--litellm"])
-        assert result.exit_code != 0
-        assert "LiteLLM backend supports YouTube URLs and GCS URIs only" in (
-            result.output
-        )
+        assert result.exit_code == 0, result.output
+        # Inline video part reached the gateway as a data: URL file block.
+        payload = client.http.post.call_args.kwargs["json"]
+        blocks = payload["messages"][0]["content"]
+        file_block = next(b for b in blocks if b["type"] == "file")
+        assert file_block["file"]["file_data"].startswith("data:video/mp4;base64,")
 
     @patch("youtube_gemini_processor.cli.get_gemini_client")
     def test_files_api_ref_rejected(self, mock_get_client: MagicMock) -> None:
@@ -1747,9 +1886,7 @@ class TestLiteLLMGuards:
         runner = CliRunner()
         result = runner.invoke(main, ["files/abc123", "--litellm"])
         assert result.exit_code != 0
-        assert "LiteLLM backend supports YouTube URLs and GCS URIs only" in (
-            result.output
-        )
+        assert "cannot resolve Files API references" in result.output
 
     @patch("youtube_gemini_processor.cli.get_gemini_client")
     def test_upload_only_rejected(

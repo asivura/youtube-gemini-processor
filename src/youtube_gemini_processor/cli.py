@@ -32,6 +32,7 @@ Examples:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -324,6 +325,12 @@ MODEL_PRICING = {
     },
     "gemini-3-flash-preview": {"input": 0.50, "output": 3.00},
     "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
+    # gemini-2.5-pro is tiered: $1.25/$10 up to 200k tokens, $2.50/$15 above.
+    "gemini-2.5-pro": {
+        "input": [(200_000, 1.25), (None, 2.50)],
+        "output": [(200_000, 10.00), (None, 15.00)],
+    },
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
 }
 
@@ -332,6 +339,8 @@ MODEL_MAX_OUTPUT_TOKENS = {
     "gemini-3.1-pro-preview": 65536,
     "gemini-3-flash-preview": 65536,
     "gemini-3.1-flash-lite": 65536,
+    "gemini-2.5-pro": 65536,
+    "gemini-2.5-flash": 65536,
     "gemini-2.5-flash-lite": 65536,
 }
 
@@ -431,6 +440,33 @@ def _gemini_schema_to_json_schema(schema: dict) -> dict:
     return result
 
 
+def _inline_data_to_openai_part(data: bytes, mime_type: str) -> dict:
+    """Map inline media bytes to an OpenAI-compatible content part.
+
+    The Anton/LiteLLM gateway accepts two inline shapes for Gemini models:
+
+    - Audio: ``{"type": "input_audio", "input_audio": {"data": <b64>,
+      "format": <fmt>}}`` where ``<fmt>`` is the short subtype (mp3/wav/...).
+    - Video: ``{"type": "file", "file": {"file_data":
+      "data:<mime>;base64,<b64>"}}``.
+
+    Args:
+        data: Raw media bytes.
+        mime_type: The media MIME type (e.g. ``audio/mpeg``, ``video/mp4``).
+    """
+    b64 = base64.b64encode(data).decode("ascii")
+    if mime_type.startswith("audio/"):
+        audio_format = AUDIO_FORMAT_FOR_MIME.get(mime_type, mime_type.split("/", 1)[-1])
+        return {
+            "type": "input_audio",
+            "input_audio": {"data": b64, "format": audio_format},
+        }
+    return {
+        "type": "file",
+        "file": {"file_data": f"data:{mime_type};base64,{b64}"},
+    }
+
+
 class _LiteLLMUsage:
     """Minimal stand-in for genai's ``usage_metadata``."""
 
@@ -461,21 +497,31 @@ class _LiteLLMModels:
         """Translate a genai-style request to an OpenAI chat/completions call.
 
         Only the shapes this tool actually builds are supported: a single
-        user ``Content`` whose parts are a video ``Part`` (``file_data``) plus a
-        text ``Part``. Video URIs (YouTube/GCS) are passed through as an OpenAI
-        ``file`` content block.
+        user ``Content`` whose parts are a media ``Part`` plus a text ``Part``.
+        Video/audio URIs (YouTube/GCS) are passed through as an OpenAI ``file``
+        content block; local media supplied inline (Gemini ``inline_data`` with
+        raw bytes) is emitted as an ``input_audio`` part (audio) or a ``file``
+        part with a base64 ``data:`` URL (video).
         """
         # Flatten parts across the provided Content object(s).
         content = contents[0] if isinstance(contents, list) else contents
         parts = getattr(content, "parts", []) or []
 
         file_uri: str | None = None
+        inline_part: dict | None = None
         prompt_text = ""
         has_video_metadata = False
         for part in parts:
             file_data = getattr(part, "file_data", None)
             if file_data is not None and getattr(file_data, "file_uri", None):
                 file_uri = file_data.file_uri
+                if getattr(part, "video_metadata", None) is not None:
+                    has_video_metadata = True
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data is not None and getattr(inline_data, "data", None):
+                inline_part = _inline_data_to_openai_part(
+                    inline_data.data, getattr(inline_data, "mime_type", "") or ""
+                )
                 if getattr(part, "video_metadata", None) is not None:
                     has_video_metadata = True
             text = getattr(part, "text", None)
@@ -496,6 +542,8 @@ class _LiteLLMModels:
             user_content.append({"type": "text", "text": prompt_text})
         if file_uri:
             user_content.append({"type": "file", "file": {"file_id": file_uri}})
+        if inline_part is not None:
+            user_content.append(inline_part)
 
         payload: dict = {
             "model": model,
@@ -814,6 +862,23 @@ AUDIO_MIME_TYPES = {
 }
 
 MediaKind = Literal["video", "audio"]
+
+# Map audio MIME types to the short "format" token expected by the OpenAI
+# ``input_audio`` content part. Covers the values in AUDIO_MIME_TYPES plus a few
+# common aliases (audio/mp3, audio/x-m4a, audio/x-wav, audio/x-flac).
+AUDIO_FORMAT_FOR_MIME = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/flac": "flac",
+    "audio/x-flac": "flac",
+    "audio/ogg": "ogg",
+    "audio/aiff": "aiff",
+}
 
 
 def is_local_file(input_path: str) -> bool:
@@ -1256,6 +1321,41 @@ def process_local_file(
     try:
         mime_type, kind = get_media_mime_type(path)
         file_size_mb = path.stat().st_size / (1024 * 1024)
+
+        # LiteLLM has no Files API: read the bytes and send them inline as a
+        # Gemini inline_data Part, which the LiteLLM adapter maps to the
+        # OpenAI-compatible audio/video content shapes.
+        if isinstance(client, LiteLLMClient):
+            from google.genai import types
+
+            if fps is not None or clip_start is not None or clip_end is not None:
+                click.echo(
+                    "Warning: --fps/--clip are ignored on the LiteLLM backend "
+                    "(no OpenAI-compatible equivalent).",
+                    err=True,
+                )
+            if verbose:
+                click.echo(
+                    f"  Sending {path.name} ({file_size_mb:.1f} MB) inline...",
+                    err=True,
+                )
+            media_part = types.Part(
+                inline_data=types.Blob(
+                    data=path.read_bytes(),
+                    mime_type=mime_type,
+                )
+            )
+            _call_gemini_and_parse(
+                client,
+                media_part,
+                model,
+                prompt,
+                analysis,
+                fallback_title=path.stem,
+                response_schema=response_schema,
+                media_resolution=media_resolution,
+            )
+            return analysis
 
         if verbose:
             click.echo(f"  Uploading {path.name} ({file_size_mb:.1f} MB)...", err=True)
@@ -2485,16 +2585,15 @@ def main(
             if verbose:
                 click.echo(f"\nProcessing: {video_input}")
 
-            # The LiteLLM backend cannot handle local files or Files API refs
-            # (no Files API over the OpenAI-compatible protocol).
-            if isinstance(client, LiteLLMClient) and (
-                is_local_file(video_input) or is_files_api_ref(video_input)
-            ):
+            # The LiteLLM backend has no Gemini Files API, so a files/... ref
+            # cannot be resolved. Local files ARE supported: their bytes are
+            # sent inline (base64) as OpenAI-compatible content parts.
+            if isinstance(client, LiteLLMClient) and is_files_api_ref(video_input):
                 raise click.ClickException(
-                    f"The LiteLLM backend supports YouTube URLs and GCS URIs only; "
+                    f"The LiteLLM backend cannot resolve Files API references; "
                     f"{video_input!r} requires the Gemini Files API. Use the Gemini "
-                    f"API key (--api-key) or Vertex AI (--vertex) backend, or upload "
-                    f"the file to GCS and pass its gs:// URI."
+                    f"API key (--api-key) or Vertex AI (--vertex) backend, or pass "
+                    f"the local file path directly (sent inline over LiteLLM)."
                 )
 
             # Use response schema for segments mode to guarantee valid JSON

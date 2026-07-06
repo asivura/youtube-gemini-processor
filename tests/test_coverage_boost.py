@@ -19,11 +19,16 @@ import pytest
 from click.testing import CliRunner
 
 from youtube_gemini_processor.cli import (
+    SEGMENTS_SCHEMA,
+    LiteLLMClient,
     VideoAnalysis,
     _format_duration,
+    _gemini_schema_to_json_schema,
     _handle_output,
     _normalize_timestamp_to_hhmmss,
     _process_single_chapter,
+    build_generate_config,
+    build_media_part,
     fetch_youtube_chapters,
     format_output_markdown,
     format_segments_json,
@@ -55,7 +60,13 @@ class TestGetGeminiClient:
     @patch("google.genai.Client")
     @patch.dict(
         "os.environ",
-        {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_USE_VERTEXAI": ""},
+        {
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "GOOGLE_GENAI_USE_VERTEXAI": "",
+            "LITELLM_API_KEY": "",
+            "LITELLM_BASE_URL": "",
+        },
         clear=False,
     )
     def test_no_auth_raises_error(self, mock_client_cls: MagicMock) -> None:
@@ -1480,3 +1491,299 @@ class TestProcessSingleChapterAnalysisError:
         )
         assert path is None
         assert "Error" in msg
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM backend
+# ---------------------------------------------------------------------------
+class TestGeminiSchemaToJsonSchema:
+    """Tests for _gemini_schema_to_json_schema type lowercasing."""
+
+    def test_lowercases_array_and_object_types(self) -> None:
+        result = _gemini_schema_to_json_schema(SEGMENTS_SCHEMA)
+        assert result["type"] == "array"
+        assert result["items"]["type"] == "object"
+        props = result["items"]["properties"]
+        assert props["segment_number"]["type"] == "integer"
+        assert props["title"]["type"] == "string"
+        # required list is preserved unchanged
+        assert "segment_number" in result["items"]["required"]
+
+    def test_non_dict_passthrough(self) -> None:
+        assert _gemini_schema_to_json_schema("STRING") == "STRING"
+
+
+class TestLiteLLMBackendSelection:
+    """Tests for LiteLLM backend selection in get_gemini_client."""
+
+    @patch.dict(
+        "os.environ",
+        {"LITELLM_BASE_URL": "https://env-gw/v1", "LITELLM_API_KEY": "sk-env"},
+    )
+    def test_flag_selects_litellm(self) -> None:
+        client = get_gemini_client(use_litellm=True)
+        assert isinstance(client, LiteLLMClient)
+        assert client.base_url == "https://env-gw/v1"
+        assert client.api_key == "sk-env"
+
+    @patch("google.genai.Client")
+    @patch.dict(
+        "os.environ",
+        {
+            "LITELLM_BASE_URL": "https://env-gw/v1",
+            "LITELLM_API_KEY": "sk-env",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "GOOGLE_GENAI_USE_VERTEXAI": "",
+        },
+    )
+    def test_env_auto_detect(self, mock_client_cls: MagicMock) -> None:
+        client = get_gemini_client()
+        assert isinstance(client, LiteLLMClient)
+
+    @patch("google.genai.Client")
+    @patch.dict(
+        "os.environ",
+        {
+            "LITELLM_BASE_URL": "https://env-gw/v1",
+            "LITELLM_API_KEY": "sk-env",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "GOOGLE_GENAI_USE_VERTEXAI": "",
+        },
+    )
+    def test_explicit_api_key_beats_litellm_autodetect(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        # An explicit --api-key must win over LITELLM_API_KEY auto-detect.
+        client = get_gemini_client(api_key="explicit-key")
+        assert not isinstance(client, LiteLLMClient)
+        mock_client_cls.assert_called_once_with(api_key="explicit-key")
+
+    @patch("google.genai.Client")
+    @patch.dict(
+        "os.environ",
+        {
+            "LITELLM_BASE_URL": "https://env-gw/v1",
+            "LITELLM_API_KEY": "sk-env",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "google-env-key",
+            "GOOGLE_GENAI_USE_VERTEXAI": "",
+        },
+    )
+    def test_env_api_key_beats_litellm_autodetect(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        # GOOGLE_API_KEY env ranks above LiteLLM auto-detect.
+        client = get_gemini_client()
+        assert not isinstance(client, LiteLLMClient)
+        mock_client_cls.assert_called_once_with(api_key="google-env-key")
+
+    @patch.dict("os.environ", {"LITELLM_API_KEY": "sk-env", "LITELLM_BASE_URL": ""})
+    def test_flag_without_base_url_raises(self) -> None:
+        with pytest.raises(click.ClickException, match="base URL"):
+            get_gemini_client(use_litellm=True)
+
+    @patch.dict("os.environ", {"LITELLM_API_KEY": "", "LITELLM_BASE_URL": ""})
+    def test_flag_without_key_raises(self) -> None:
+        with pytest.raises(click.ClickException, match="API key"):
+            get_gemini_client(use_litellm=True, litellm_base_url="https://gw/v1")
+
+
+class TestLiteLLMRequestTranslation:
+    """Tests that LiteLLMClient translates genai-style requests correctly."""
+
+    def _client(self) -> LiteLLMClient:
+        return LiteLLMClient(base_url="https://gw/v1", api_key="sk-test")
+
+    def _mock_http_response(self, content: str = "hello") -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 45},
+        }
+        return resp
+
+    def test_youtube_uri_becomes_file_block(self) -> None:
+        client = self._client()
+        client.http = MagicMock()
+        client.http.post.return_value = self._mock_http_response()
+
+        video_part = build_media_part(
+            "https://www.youtube.com/watch?v=abc123", "video/mp4"
+        )
+        config = build_generate_config("gemini-2.5-flash")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                __import__("google.genai", fromlist=["types"]).types.Content(
+                    role="user",
+                    parts=[
+                        video_part,
+                        __import__("google.genai", fromlist=["types"]).types.Part(
+                            text="describe it"
+                        ),
+                    ],
+                )
+            ],
+            config=config,
+        )
+
+        # Response shim exposes text + usage_metadata
+        assert response.text == "hello"
+        assert response.usage_metadata.prompt_token_count == 123
+        assert response.usage_metadata.candidates_token_count == 45
+
+        # Payload carries a text block + a file block with the YouTube URI
+        payload = client.http.post.call_args.kwargs["json"]
+        blocks = payload["messages"][0]["content"]
+        types_ = {b["type"] for b in blocks}
+        assert types_ == {"text", "file"}
+        file_block = next(b for b in blocks if b["type"] == "file")
+        assert file_block["file"]["file_id"] == (
+            "https://www.youtube.com/watch?v=abc123"
+        )
+        assert payload["model"] == "gemini-2.5-flash"
+        # Auth header set
+        assert (
+            client.http.post.call_args.kwargs["headers"]["Authorization"]
+            == "Bearer sk-test"
+        )
+
+    def test_response_schema_becomes_json_schema(self) -> None:
+        from google.genai import types
+
+        client = self._client()
+        client.http = MagicMock()
+        client.http.post.return_value = self._mock_http_response(content="[]")
+
+        video_part = build_media_part("https://youtu.be/x", "video/mp4")
+        config = build_generate_config(
+            "gemini-2.5-flash", response_schema=SEGMENTS_SCHEMA
+        )
+        client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[video_part, types.Part(text="segments")],
+                )
+            ],
+            config=config,
+        )
+        payload = client.http.post.call_args.kwargs["json"]
+        rf = payload["response_format"]
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["schema"]["type"] == "array"
+
+    def test_video_metadata_emits_warning(self, capsys) -> None:
+        from google.genai import types
+
+        client = self._client()
+        client.http = MagicMock()
+        client.http.post.return_value = self._mock_http_response()
+
+        video_part = build_media_part("https://youtu.be/x", "video/mp4", fps=2.0)
+        config = build_generate_config(
+            "gemini-2.5-flash", media_resolution="MEDIA_RESOLUTION_LOW"
+        )
+        client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Content(role="user", parts=[video_part, types.Part(text="q")])
+            ],
+            config=config,
+        )
+        captured = capsys.readouterr()
+        assert "ignored on the LiteLLM backend" in captured.err
+
+    def test_non_200_raises(self) -> None:
+        from google.genai import types
+
+        client = self._client()
+        client.http = MagicMock()
+        err = MagicMock()
+        err.status_code = 500
+        err.text = "boom"
+        client.http.post.return_value = err
+
+        video_part = build_media_part("https://youtu.be/x", "video/mp4")
+        config = build_generate_config("gemini-2.5-flash")
+        with pytest.raises(click.ClickException, match="LiteLLM request failed"):
+            client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Content(role="user", parts=[video_part, types.Part(text="q")])
+                ],
+                config=config,
+            )
+
+
+class TestLiteLLMGuards:
+    """Tests that unsupported operations are guarded on the LiteLLM backend."""
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_local_file_rejected(
+        self, mock_get_client: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_get_client.return_value = LiteLLMClient(
+            base_url="https://gw/v1", api_key="sk-test"
+        )
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"data")
+        runner = CliRunner()
+        result = runner.invoke(main, [str(video), "--litellm"])
+        assert result.exit_code != 0
+        assert "LiteLLM backend supports YouTube URLs and GCS URIs only" in (
+            result.output
+        )
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_files_api_ref_rejected(self, mock_get_client: MagicMock) -> None:
+        mock_get_client.return_value = LiteLLMClient(
+            base_url="https://gw/v1", api_key="sk-test"
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["files/abc123", "--litellm"])
+        assert result.exit_code != 0
+        assert "LiteLLM backend supports YouTube URLs and GCS URIs only" in (
+            result.output
+        )
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_upload_only_rejected(
+        self, mock_get_client: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_get_client.return_value = LiteLLMClient(
+            base_url="https://gw/v1", api_key="sk-test"
+        )
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"data")
+        runner = CliRunner()
+        result = runner.invoke(main, [str(video), "--litellm", "--upload-only"])
+        assert result.exit_code != 0
+        assert "does not support the Gemini Files API" in result.output
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_list_files_rejected(self, mock_get_client: MagicMock) -> None:
+        mock_get_client.return_value = LiteLLMClient(
+            base_url="https://gw/v1", api_key="sk-test"
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["--litellm", "--list-files"])
+        assert result.exit_code != 0
+        assert "does not support the Gemini Files API" in result.output
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_youtube_split_rejected(self, mock_get_client: MagicMock) -> None:
+        mock_get_client.return_value = LiteLLMClient(
+            base_url="https://gw/v1", api_key="sk-test"
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["https://www.youtube.com/watch?v=abc123", "--litellm", "--split"],
+        )
+        assert result.exit_code != 0
+        assert "Chapter splitting" in result.output

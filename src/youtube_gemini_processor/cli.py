@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Literal
 
 import click
+import httpx
 
 
 @dataclass
@@ -406,22 +407,216 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> UsageSt
     )
 
 
+def _gemini_schema_to_json_schema(schema: dict) -> dict:
+    """Recursively lowercase Gemini's UPPERCASE type names to JSON Schema types.
+
+    Gemini's ``response_schema`` uses ``"type": "ARRAY"``/``"OBJECT"``/``"STRING"``
+    etc., while the OpenAI-compatible ``response_format.json_schema`` expects
+    standard JSON Schema lowercase types (``"array"``, ``"object"``, ...).
+    """
+    if not isinstance(schema, dict):
+        return schema
+    result: dict = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, str):
+            result[key] = value.lower()
+        elif key == "items":
+            result[key] = _gemini_schema_to_json_schema(value)
+        elif key == "properties" and isinstance(value, dict):
+            result[key] = {
+                k: _gemini_schema_to_json_schema(v) for k, v in value.items()
+            }
+        else:
+            result[key] = value
+    return result
+
+
+class _LiteLLMUsage:
+    """Minimal stand-in for genai's ``usage_metadata``."""
+
+    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.prompt_token_count = prompt_tokens
+        self.candidates_token_count = completion_tokens
+
+
+class _LiteLLMResponse:
+    """Minimal stand-in for genai's ``GenerateContentResponse``.
+
+    Exposes only what :func:`_call_gemini_and_parse` reads: ``.text`` and
+    ``.usage_metadata``.
+    """
+
+    def __init__(self, text: str, usage_metadata: _LiteLLMUsage | None) -> None:
+        self.text = text
+        self.usage_metadata = usage_metadata
+
+
+class _LiteLLMModels:
+    """Implements the ``client.models.generate_content(...)`` surface."""
+
+    def __init__(self, client: LiteLLMClient) -> None:
+        self._client = client
+
+    def generate_content(self, *, model: str, contents, config=None):
+        """Translate a genai-style request to an OpenAI chat/completions call.
+
+        Only the shapes this tool actually builds are supported: a single
+        user ``Content`` whose parts are a video ``Part`` (``file_data``) plus a
+        text ``Part``. Video URIs (YouTube/GCS) are passed through as an OpenAI
+        ``file`` content block.
+        """
+        # Flatten parts across the provided Content object(s).
+        content = contents[0] if isinstance(contents, list) else contents
+        parts = getattr(content, "parts", []) or []
+
+        file_uri: str | None = None
+        prompt_text = ""
+        has_video_metadata = False
+        for part in parts:
+            file_data = getattr(part, "file_data", None)
+            if file_data is not None and getattr(file_data, "file_uri", None):
+                file_uri = file_data.file_uri
+                if getattr(part, "video_metadata", None) is not None:
+                    has_video_metadata = True
+            text = getattr(part, "text", None)
+            if text:
+                prompt_text = text
+
+        # Warn about options that have no OpenAI-compatible equivalent.
+        media_resolution = getattr(config, "media_resolution", None)
+        if has_video_metadata or media_resolution:
+            click.echo(
+                "Warning: --fps/--clip/--media-resolution are ignored on the "
+                "LiteLLM backend (no OpenAI-compatible equivalent).",
+                err=True,
+            )
+
+        user_content: list[dict] = []
+        if prompt_text:
+            user_content.append({"type": "text", "text": prompt_text})
+        if file_uri:
+            user_content.append({"type": "file", "file": {"file_id": file_uri}})
+
+        payload: dict = {
+            "model": model,
+            "messages": [{"role": "user", "content": user_content}],
+        }
+
+        max_tokens = getattr(config, "max_output_tokens", None)
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+
+        response_schema = getattr(config, "response_schema", None)
+        if response_schema:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "strict": True,
+                    "schema": _gemini_schema_to_json_schema(response_schema),
+                },
+            }
+
+        resp = self._client.http.post(
+            f"{self._client.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self._client.api_key}"},
+            json=payload,
+        )
+        if resp.status_code != 200:
+            raise click.ClickException(
+                f"LiteLLM request failed ({resp.status_code}): {resp.text[:500]}"
+            )
+        data = resp.json()
+
+        choice = (data.get("choices") or [{}])[0]
+        text = (choice.get("message") or {}).get("content") or ""
+
+        usage_data = data.get("usage") or {}
+        usage = _LiteLLMUsage(
+            prompt_tokens=usage_data.get("prompt_tokens", 0) or 0,
+            completion_tokens=usage_data.get("completion_tokens", 0) or 0,
+        )
+        return _LiteLLMResponse(text=text, usage_metadata=usage)
+
+
+class LiteLLMClient:
+    """Adapter that speaks an OpenAI-compatible endpoint but duck-types
+    :class:`google.genai.Client` closely enough for this tool.
+
+    Only the ``client.models.generate_content(...)`` path is implemented; the
+    Gemini Files API (uploads, ``files/*`` refs) is not available over the
+    OpenAI-compatible protocol and is guarded against in ``main()``.
+    """
+
+    def __init__(self, base_url: str, api_key: str) -> None:
+        # Normalize to a bare base (no trailing slash); "/chat/completions"
+        # is appended per-request.
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.http = httpx.Client(timeout=httpx.Timeout(600.0))
+        self.models = _LiteLLMModels(self)
+
+
+def _build_litellm_client(base_url: str | None, api_key: str | None) -> LiteLLMClient:
+    """Resolve LiteLLM config (arg → env) and construct the client."""
+    resolved_base_url = base_url or os.environ.get("LITELLM_BASE_URL")
+    if not resolved_base_url:
+        raise click.ClickException(
+            "LiteLLM backend requires a base URL. Set LITELLM_BASE_URL "
+            "environment variable or pass --litellm-base-url"
+        )
+    resolved_key = api_key or os.environ.get("LITELLM_API_KEY")
+    if not resolved_key:
+        raise click.ClickException(
+            "LiteLLM backend requires an API key. Set LITELLM_API_KEY "
+            "environment variable or pass --litellm-api-key"
+        )
+    click.echo(f"Using LiteLLM endpoint ({resolved_base_url})", err=True)
+    return LiteLLMClient(base_url=resolved_base_url, api_key=resolved_key)
+
+
+def _require_files_api_backend(client) -> None:
+    """Reject Files API operations when the LiteLLM backend is active."""
+    if isinstance(client, LiteLLMClient):
+        raise click.ClickException(
+            "The LiteLLM backend does not support the Gemini Files API "
+            "(--upload-only / --list-files / --delete-file). Use the Gemini "
+            "API key (--api-key) or Vertex AI (--vertex) backend for these."
+        )
+
+
 def get_gemini_client(
     api_key: str | None = None,
     use_vertex: bool = False,
     project: str | None = None,
     location: str | None = None,
+    use_litellm: bool = False,
+    litellm_base_url: str | None = None,
+    litellm_api_key: str | None = None,
 ):
     """
-    Initialize Gemini client with API key or Vertex AI authentication.
+    Initialize a client with LiteLLM, API key, or Vertex AI authentication.
 
     Authentication methods (in order of priority):
-    1. Explicit API key (--api-key flag)
-    2. Vertex AI with ADC (--vertex flag) - uses gcloud auth
-    3. Environment variables (GEMINI_API_KEY or GOOGLE_API_KEY)
+    1. LiteLLM / OpenAI-compatible endpoint (--litellm flag)
+    2. Explicit API key (--api-key flag)
+    3. Vertex AI with ADC (--vertex flag) - uses gcloud auth
     4. Auto-detect Vertex AI if GOOGLE_GENAI_USE_VERTEXAI=true
+    5. Environment variables (GEMINI_API_KEY or GOOGLE_API_KEY)
+    6. Auto-detect LiteLLM if LITELLM_API_KEY is set (last resort)
+
+    The LiteLLM backend targets any OpenAI-compatible gateway that proxies
+    Gemini models. It supports YouTube URLs and GCS URIs but NOT the Gemini
+    Files API (local uploads, files/* refs) or per-request video metadata
+    (fps/clip/media-resolution).
     """
     from google import genai
+
+    litellm_key = litellm_api_key or os.environ.get("LITELLM_API_KEY")
+
+    # An explicit --litellm flag takes top priority over every other backend.
+    if use_litellm:
+        return _build_litellm_client(litellm_base_url, litellm_key)
 
     # Check if Vertex AI mode is requested or auto-detected
     vertex_env = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
@@ -466,14 +661,20 @@ def get_gemini_client(
     key = (
         api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     )
-    if not key:
-        raise click.ClickException(
-            "Authentication required. Choose one:\n"
-            "  1. API key: Set GEMINI_API_KEY env var or pass --api-key\n"
-            "  2. Vertex AI: Pass --vertex flag (requires gcloud auth application-default login)\n"
-            "\nGet an API key at: https://aistudio.google.com/app/apikey"
-        )
-    return genai.Client(api_key=key)
+    if key:
+        return genai.Client(api_key=key)
+
+    # Last resort: auto-detect the LiteLLM backend from LITELLM_API_KEY.
+    if litellm_key:
+        return _build_litellm_client(litellm_base_url, litellm_key)
+
+    raise click.ClickException(
+        "Authentication required. Choose one:\n"
+        "  1. API key: Set GEMINI_API_KEY env var or pass --api-key\n"
+        "  2. Vertex AI: Pass --vertex flag (requires gcloud auth application-default login)\n"
+        "  3. LiteLLM: Set LITELLM_BASE_URL + LITELLM_API_KEY or pass --litellm\n"
+        "\nGet an API key at: https://aistudio.google.com/app/apikey"
+    )
 
 
 def validate_youtube_url(url: str) -> str:
@@ -1935,6 +2136,26 @@ def _handle_output(
     help="GCP location for Vertex AI (default: global)",
 )
 @click.option(
+    "--litellm",
+    "use_litellm",
+    is_flag=True,
+    help="Use a LiteLLM / OpenAI-compatible endpoint (set LITELLM_BASE_URL and "
+    "LITELLM_API_KEY). Supports YouTube URLs and GCS URIs only.",
+)
+@click.option(
+    "--litellm-base-url",
+    envvar="LITELLM_BASE_URL",
+    default=None,
+    help="Base URL for the LiteLLM endpoint, e.g. https://host/v1 "
+    "(or set LITELLM_BASE_URL)",
+)
+@click.option(
+    "--litellm-api-key",
+    envvar="LITELLM_API_KEY",
+    default=None,
+    help="API key for the LiteLLM endpoint (or set LITELLM_API_KEY)",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -2002,6 +2223,9 @@ def main(
     vertex: bool,
     project: str | None,
     location: str | None,
+    use_litellm: bool,
+    litellm_base_url: str | None,
+    litellm_api_key: str | None,
     verbose: bool,
     split: bool,
     workers: int,
@@ -2093,6 +2317,12 @@ def main(
             gcloud auth application-default login
             yt-process "URL" --vertex --project YOUR_PROJECT
 
+        Option 3 - LiteLLM / OpenAI-compatible endpoint:
+            export LITELLM_BASE_URL="https://your-gateway/v1"
+            export LITELLM_API_KEY="sk-..."
+            yt-process "URL" --litellm
+            (YouTube URLs and GCS URIs only; no Files API / local uploads)
+
     \b
     Environment Variables:
         GEMINI_API_KEY           Google Gemini API key
@@ -2102,6 +2332,8 @@ def main(
         YT_PROCESS_LOCATION      GCP location (tool-specific, preferred)
         GOOGLE_CLOUD_LOCATION    GCP location (fallback, default: global)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
+        LITELLM_BASE_URL         Base URL for a LiteLLM / OpenAI-compatible endpoint
+        LITELLM_API_KEY          API key for the LiteLLM endpoint
     """
     # Auto-detect location based on model if not specified
     if location is None:
@@ -2125,7 +2357,11 @@ def main(
             use_vertex=vertex,
             project=project,
             location=location,
+            use_litellm=use_litellm,
+            litellm_base_url=litellm_base_url,
+            litellm_api_key=litellm_api_key,
         )
+        _require_files_api_backend(client)
         _handle_file_management(client, list_files, delete_file)
         return
 
@@ -2163,6 +2399,9 @@ def main(
         use_vertex=vertex,
         project=project,
         location=location,
+        use_litellm=use_litellm,
+        litellm_base_url=litellm_base_url,
+        litellm_api_key=litellm_api_key,
     )
 
     # Handle upload-only mode
@@ -2171,6 +2410,7 @@ def main(
             raise click.ClickException(
                 "--upload-only requires a local file path as input"
             )
+        _require_files_api_backend(client)
         _handle_upload_only(client, input, verbose)
         return
 
@@ -2207,6 +2447,12 @@ def main(
 
     # YouTube chunked processing: --split with YouTube URL (not segments mode)
     if split and input and is_youtube_url(input) and not is_segments_mode:
+        if isinstance(client, LiteLLMClient):
+            raise click.ClickException(
+                "Chapter splitting (--split) relies on per-chapter clipping, "
+                "which the LiteLLM backend does not support. Use the Gemini API "
+                "key (--api-key) or Vertex AI (--vertex) backend for --split."
+            )
         _handle_chapter_splitting(
             client=client,
             url=input,
@@ -2238,6 +2484,18 @@ def main(
         for video_input in progress_inputs:
             if verbose:
                 click.echo(f"\nProcessing: {video_input}")
+
+            # The LiteLLM backend cannot handle local files or Files API refs
+            # (no Files API over the OpenAI-compatible protocol).
+            if isinstance(client, LiteLLMClient) and (
+                is_local_file(video_input) or is_files_api_ref(video_input)
+            ):
+                raise click.ClickException(
+                    f"The LiteLLM backend supports YouTube URLs and GCS URIs only; "
+                    f"{video_input!r} requires the Gemini Files API. Use the Gemini "
+                    f"API key (--api-key) or Vertex AI (--vertex) backend, or upload "
+                    f"the file to GCS and pass its gs:// URI."
+                )
 
             # Use response schema for segments mode to guarantee valid JSON
             schema = SEGMENTS_SCHEMA if is_segments_mode else None

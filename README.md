@@ -46,7 +46,7 @@ uv pip install -e .
 
 ## Authentication
 
-The tool supports two authentication methods: Gemini API key and Vertex AI.
+The tool supports three authentication methods: Gemini API key, Vertex AI, and a LiteLLM / OpenAI-compatible endpoint.
 
 ### Option 1: Gemini API Key
 
@@ -106,12 +106,52 @@ yt-process "./video.mp4"
 
 **Note:** The Gemini Files API (used for local file uploads, `--upload-only`, `--list-files`) is not available with Vertex AI. To process local files with Vertex AI, upload them to GCS first (see [GCS URIs](#gcs-uris) below).
 
+### Option 3: LiteLLM / OpenAI-compatible endpoint
+
+Route requests through any [LiteLLM](https://github.com/BerriAI/litellm) proxy (or other OpenAI-compatible gateway) that serves Gemini models. This lets you authenticate with a single gateway key instead of a Google API key or gcloud ADC.
+
+**Setup:**
+
+```bash
+export LITELLM_BASE_URL="https://your-gateway/v1"
+export LITELLM_API_KEY="sk-..."
+```
+
+**Usage:**
+
+```bash
+# Explicit flag
+yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --litellm
+
+# Or auto-detected when LITELLM_API_KEY is set and no other auth is given
+yt-process "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Base URL / key can also be passed as flags
+yt-process "URL" --litellm --litellm-base-url https://your-gateway/v1 --litellm-api-key sk-...
+```
+
+**Supported vs. unsupported over this backend:**
+
+| Feature | Supported |
+|---------|-----------|
+| YouTube URLs | ✅ |
+| GCS URIs (`gs://`) | ✅ |
+| All analysis modes (incl. `segments`) | ✅ |
+| Custom prompts, model selection | ✅ |
+| Local file uploads / Files API (`--upload-only`, `--list-files`, `files/abc123`) | ❌ (no Files API on the endpoint) |
+| `--fps` / `--clip` / `--media-resolution` | ❌ (ignored with a warning) |
+| YouTube chapter `--split` | ❌ (relies on clipping) |
+
+For the unsupported operations, use the Gemini API-key or Vertex AI backend.
+
 ### Authentication priority
 
-1. `--api-key` flag
-2. `--vertex` flag (Vertex AI with ADC)
-3. `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variables
-4. `GOOGLE_GENAI_USE_VERTEXAI=true` environment variable
+1. `--litellm` flag (LiteLLM / OpenAI-compatible endpoint)
+2. `--api-key` flag
+3. `--vertex` flag (Vertex AI with ADC)
+4. `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variables
+5. `GOOGLE_GENAI_USE_VERTEXAI=true` environment variable
+6. `LITELLM_API_KEY` set (auto-enables the LiteLLM backend when no other auth is given)
 
 ## Input Types
 
@@ -336,6 +376,9 @@ Options:
   --vertex                       Use Vertex AI authentication
   --project TEXT                  GCP project for Vertex AI
   --location TEXT                 GCP location for Vertex AI
+  --litellm                      Use a LiteLLM / OpenAI-compatible endpoint
+  --litellm-base-url TEXT         Base URL (or set LITELLM_BASE_URL)
+  --litellm-api-key TEXT          API key (or set LITELLM_API_KEY)
   --fps FLOAT                    Frame sampling rate (default: 1 FPS)
   --clip TEXT                    Process a clip: START-END (e.g., 1:30-5:00)
   --media-resolution [low|medium|high]

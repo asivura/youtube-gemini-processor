@@ -102,17 +102,26 @@ class TestGetGeminiClient:
     def test_vertex_env_auto_detect(
         self, mock_client_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Clear every var that could influence resolution so the test does not
+        # depend on ambient environment or test-ordering (CI runners inherit a
+        # different os.environ than a dev shell). The client now honors ONLY the
+        # tool-specific YT_PROCESS_PROJECT / YT_PROCESS_LOCATION (generic GCP
+        # vars were intentionally dropped), so set that one.
         for var in (
-            "YT_PROCESS_PROJECT",
             "GCP_PROJECT",
+            "GOOGLE_CLOUD_PROJECT",
             "CLOUDSDK_CORE_PROJECT",
             "YT_PROCESS_LOCATION",
             "GOOGLE_CLOUD_LOCATION",
             "CLOUDSDK_COMPUTE_REGION",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "LITELLM_API_KEY",
+            "LITELLM_BASE_URL",
         ):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
-        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "env-proj")
+        monkeypatch.setenv("YT_PROCESS_PROJECT", "env-proj")
         get_gemini_client()
         call_kwargs = mock_client_cls.call_args[1]
         assert call_kwargs["vertexai"] is True

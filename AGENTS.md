@@ -62,8 +62,8 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 ## Input Types
 
 - **YouTube URLs** - Passed directly to Gemini via `file_uri` (video only)
-- **Local files** - Uploaded via Gemini Files API, then processed (API key only, not Vertex AI)
-- **Files API references** - `files/abc123` references to previously uploaded files (reuse for 48h)
+- **Local files** - Files API upload on the Developer API; inline bytes or GCS staging on Vertex; inline base64 on LiteLLM (see below)
+- **Files API references** - `files/abc123` references to previously uploaded files (reuse for 48h, Developer API only)
 - **GCS URIs** - `gs://` paths processed directly via Vertex AI
 
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
@@ -91,9 +91,21 @@ yt-process --list-files
 yt-process --delete-file files/abc123
 ```
 
+### Local Files on Vertex AI
+
+Vertex AI has no Files API — `client.files.upload()` raises `ValueError: This method is only supported in the Gemini Developer client`. `process_local_file()` routes around this automatically:
+
+| File size | Transport | Builder |
+|-----------|-----------|---------|
+| ≤ `INLINE_MAX_BYTES` (20 MB) | Inline `Part(inline_data=Blob(...))` | `build_inline_media_part()` |
+| > 20 MB with `--gcs-bucket` | Staged via `gcloud storage cp`, then `gs://` URI | `upload_to_gcs()` |
+| > 20 MB without a bucket | `ClickException` listing all four options | `_build_vertex_local_part()` |
+
+`is_vertex_client()` compares `client.vertexai is True` (not truthiness) so stubs and mocks never take the Vertex path. `_require_developer_api()` guards `--upload-only`, `--list-files`, `--delete-file`, and `files/` inputs with an actionable message.
+
 ### GCS Processing (Vertex AI)
 
-For Vertex AI processing (when `GOOGLE_GENAI_USE_VERTEXAI=true`), local files must be uploaded to GCS first since the Files API is not supported with Vertex AI.
+A `gs://` URI can always be passed directly as input.
 
 ```bash
 # Upload and process via Vertex AI
@@ -213,6 +225,32 @@ Priority order:
 5. `GOOGLE_GENAI_USE_VERTEXAI=true` env var
 6. `LITELLM_API_KEY` set with no other auth (auto-enables LiteLLM)
 
-## Model Pricing
+## Models and Pricing
 
-Hardcoded in `MODEL_PRICING` dict. When adding new models, update this dictionary with input/output costs per 1M tokens.
+`--model` takes **any** string. `MODEL_PRICING` is pricing data, not an allow-list: an unknown model still runs, and `calculate_cost()` returns `pricing_known=False` with zeroed costs rather than borrowing another model's rates. Adding a model to `MODEL_PRICING` (and `SUGGESTED_MODELS`) only enables cost reporting.
+
+Entry shape: `input`/`output` are a flat float (USD per 1M tokens) or a tier table of `(upper_bound, price)` tuples ending in `(None, price)`. Optional `audio_input` overrides `input` for tokens Gemini reports under the AUDIO modality.
+
+As of August 2026 the frontier Pro model is `gemini-3.1-pro-preview` (the default). **There is no Gemini 3.5 or 3.6 Pro** — the 3.5/3.6 releases are Flash-tier only, and 3.5 Pro has never reached the public API. `gemini-2.5-pro` is carried as the stable fallback because the default is a preview model and preview models get retired on short notice.
+
+### Cost accuracy
+
+`extract_usage()` is the single place token counts are read. Three things it gets right that a naive `candidates_token_count` read does not:
+
+1. **Thinking tokens bill as output.** `thoughts_token_count` is reported separately by the API but charged at the output rate. It is folded into `UsageStats.output_tokens` and broken out in `thoughts_tokens`. On Gemini 3 models thinking often dominates: a short call can be 9 visible tokens against 207 reasoning tokens.
+2. **Audio input has its own rate** on several models. `prompt_tokens_details` gives the per-modality split.
+3. **Non-integer fields coerce to 0** via `_as_int()` rather than propagating into format strings.
+
+## Exit Codes
+
+`main()` raises `SystemExit(1)` if any input failed and `SystemExit(2)` if all succeeded but output was truncated. Never make failures exit 0 — an error document written to disk with a success code is undetectable from a script and was the tool's worst automation bug.
+
+## Truncation
+
+`_call_gemini_and_parse()` reads `finish_reason`. `MAX_TOKENS` sets `analysis.truncated`, warns on stderr, and adds a banner to the document. `response.text` is `Optional[str]` and is `None` when a response is blocked or spends its whole budget on reasoning; that case raises a `ClickException` naming the finish reason instead of a bare `TypeError` from the regexes.
+
+## Prompts
+
+`PROMPTS` (video) and `AUDIO_PROMPTS` (audio), selected by `select_prompt(mode, kind)`. Audio variants exist because the video prompts request "Visual Content" sections and `[SLIDE: ...]` markers, which lead a model to invent slides for an audio-only file.
+
+Every built-in prompt carries a `{duration_line}` placeholder that **must** be filled via `.format()` before sending — an unformatted template ships the literal string `{duration_line}` to the model. Custom `--prompt` text is never formatted, since user text may contain braces.

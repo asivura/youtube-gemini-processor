@@ -298,14 +298,20 @@ class TestCalculateCost:
         assert stats.output_cost == 0.40  # $0.40 per 1M output tokens
         assert stats.total_cost == 0.50
 
-    def test_unknown_model_uses_default(self) -> None:
-        """Test unknown models use default pricing (gemini-3.1-pro-preview tiers)."""
-        # 1M input crosses the 200k tier boundary on the default model.
+    def test_unknown_model_reports_tokens_but_no_cost(self) -> None:
+        """Unknown models report usage with cost explicitly unknown.
+
+        Borrowing another model's rate card would print a confidently wrong
+        dollar figure, so pricing_known goes False instead.
+        """
         stats = calculate_cost("unknown-model", 1_000_000, 100_000)
-        # input: 200k * $2/M + 800k * $4/M = $0.40 + $3.20 = $3.60
-        assert stats.input_cost == pytest.approx(3.60)
-        # output 100k stays in the first tier ($12/M).
-        assert stats.output_cost == pytest.approx(1.20)
+        assert stats.pricing_known is False
+        assert stats.input_tokens == 1_000_000
+        assert stats.output_tokens == 100_000
+        assert stats.total_tokens == 1_100_000
+        assert stats.input_cost == 0.0
+        assert stats.output_cost == 0.0
+        assert stats.total_cost == 0.0
 
     def test_zero_tokens(self) -> None:
         """Test zero token counts."""
@@ -1162,8 +1168,9 @@ class TestCLISegmentsMode:
             ],
         )
 
-        # Should not crash with UnboundLocalError, should show error in output
-        assert result.exit_code == 0
+        # Should not crash with UnboundLocalError, should show error in output,
+        # and must exit non-zero so callers can detect the failure.
+        assert result.exit_code == 1
         assert "Error" in result.output
 
 

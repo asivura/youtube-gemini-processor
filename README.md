@@ -260,20 +260,68 @@ yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --prompt "List all tools, 
 
 ### Model Selection
 
+`--model` accepts **any** model ID. The table below is pricing data, not an allow-list, so a model Google ships tomorrow works today (cost is simply reported as unknown until it is added here).
+
+| Model | Status | Input / Output per 1M | Use for |
+|-------|--------|----------------------|---------|
+| `gemini-3.1-pro-preview` | preview, **default** | $2 / $12 (≤200k), $4 / $18 above | Best quality; the only frontier Pro model |
+| `gemini-3.6-flash` | stable | $1.50 / $7.50 | Newest Flash; best speed/quality balance |
+| `gemini-3.5-flash` | stable | $1.50 / $9.00 | Previous Flash generation |
+| `gemini-2.5-pro` | stable | $1.25 / $10 (≤200k), $2.50 / $15 above | Stable Pro fallback if the preview model is retired |
+| `gemini-3.5-flash-lite` | stable | $0.30 / $2.50 | Cheap, current |
+| `gemini-3.1-flash-lite` | stable | $0.25 / $1.50 | Cheapest 3.x |
+| `gemini-2.5-flash-lite` | stable | $0.10 / $0.40 | Cheapest overall; bulk transcription |
+
 ```bash
-yt-process "./video.mp4" --model gemini-3.1-pro-preview   # Default, best quality (preview)
-yt-process "./video.mp4" --model gemini-3-flash-preview   # Faster, lower cost (preview)
-yt-process "./video.mp4" --model gemini-3.1-flash-lite    # GA, cheapest 3.x tier
-yt-process "./video.mp4" --model gemini-2.5-flash-lite    # GA, cheapest 2.5 tier
+yt-process "./video.mp4" --model gemini-3.6-flash        # Newest Flash
+yt-process "./video.mp4" --model gemini-2.5-flash-lite   # Cheapest
 ```
 
-**Migration note (May 2026)** — scripts pinned to a removed model should switch to:
+**There is no Gemini 3.5 or 3.6 Pro.** As of August 2026, `gemini-3.1-pro-preview` is the frontier Pro model. Gemini 3.5 Pro was announced at I/O in May 2026 but has slipped GA repeatedly and is not in the public API. The 3.5/3.6 releases are Flash-tier only.
 
-- `gemini-2.5-flash` → `gemini-2.5-flash-lite`
-- `gemini-2.5-pro` or `gemini-3-pro-preview` → `gemini-3.1-pro-preview`
-- `gemini-2.0-flash` → `gemini-3.1-flash-lite`
+**The default is a preview model.** Preview models get retired with short notice (`gemini-3-pro-preview` was shut off on 9 March 2026). `gemini-2.5-pro` is kept in the table as the stable Pro fallback.
 
-**Tiered pricing for `gemini-3.1-pro-preview`** — Google charges a tiered rate ($2/$12 per 1M tokens for the first 200k tokens, $4/$18 above). `calculate_cost()` walks the tier table and bills tokens in each range at that range's rate, so the cost printed at the end of each run matches the actual billed amount even for multi-hour videos that cross 200k tokens. To keep the bill down, stay below the threshold with `--media-resolution low` or a lower `--fps`.
+**Migration note** — scripts pinned to a removed model should switch to:
+
+- `gemini-2.0-flash` / `gemini-2.0-flash-lite` → `gemini-3.1-flash-lite`
+- `gemini-3-pro-preview` → `gemini-3.1-pro-preview`
+- `gemini-3-flash-preview` → `gemini-3.6-flash`
+
+### Cost Reporting
+
+The usage line printed with every run reflects what Google actually bills:
+
+- **Thinking tokens count as output.** Gemini reports reasoning tokens separately from the visible answer, but bills them at the output rate. They are folded into the output figure and also broken out, so a run showing `262 output (incl. 242 thinking)` is telling you 92% of your output spend was reasoning. Cap it with `--thinking-level low`.
+- **Audio input bills at its own rate** on several models (up to 3x text/video). The per-modality split is read from the response and priced accordingly.
+- **Tiered pricing is walked properly.** Pro models charge more above 200k tokens; the tier table bills each range at its own rate. To stay under the threshold on long videos, use `--media-resolution low` or a lower `--fps`.
+- **Unknown models report no cost** rather than borrowing another model's rate card.
+
+### Vertex AI and Local Files
+
+Vertex AI has **no Files API** — `client.files.upload()` raises there. Local files are handled automatically:
+
+| File size | Transport |
+|-----------|-----------|
+| ≤ 20 MB | Sent inline in the request, no staging |
+| > 20 MB | Staged to GCS via `--gcs-bucket` (needs the `gcloud` CLI) |
+
+```bash
+yt-process ./voice-memo.m4a --vertex                            # inline, just works
+yt-process ./long-meeting.mp4 --vertex --gcs-bucket my-bucket   # staged to GCS
+export YT_PROCESS_GCS_BUCKET=my-bucket                          # or set it once
+```
+
+Over 20 MB without a bucket, the error spells out all four options rather than surfacing the SDK's opaque "only supported in the Gemini Developer client". `--upload-only`, `--list-files`, and `--delete-file` are Files-API-only and fail fast under `--vertex`.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | All inputs processed successfully |
+| 1 | At least one input failed |
+| 2 | All inputs succeeded but at least one output was truncated at the token cap |
+
+Failures previously exited 0 with an error document written to the output path, which made them undetectable from a script.
 
 ### Video Processing Options
 
@@ -368,8 +416,13 @@ Options:
   -m, --mode [comprehensive|concise|transcript|segments]
                                   Analysis mode (default: comprehensive)
   -p, --prompt TEXT               Custom prompt (overrides --mode)
-  --model [gemini-3.1-pro-preview|gemini-3-flash-preview|gemini-3.1-flash-lite|gemini-2.5-flash-lite]
-                                  Gemini model (default: gemini-3.1-pro-preview)
+  --model TEXT                    Any Gemini model ID (default: gemini-3.1-pro-preview)
+  --thinking-level [minimal|low|medium|high]
+                                  Reasoning effort; lower is cheaper and faster
+  --timestamp-offset TEXT         Shift emitted timestamps (SS, MM:SS, HH:MM:SS)
+  --gcs-bucket TEXT               Bucket for staging local files on Vertex
+                                  (or set YT_PROCESS_GCS_BUCKET)
+  --max-retries INTEGER           Retries for 429/5xx errors (default: 3)
   --api-key TEXT                  Gemini API key (or set GEMINI_API_KEY)
   --vertex                       Use Vertex AI authentication
   --project TEXT                  GCP project for Vertex AI
@@ -382,7 +435,7 @@ Options:
   --media-resolution [low|medium|high]
                                   Frame resolution (default: high)
   --split                        Split video into segments (segments mode) or by chapters (YouTube URLs)
-  --workers INTEGER               Number of parallel workers for --split with YouTube URLs (default: 4)
+  --workers INTEGER               Parallel workers for --split and batch mode (default: 4)
   --upload-only                  Upload file and print reference without processing
   --list-files                   List files uploaded to the Files API
   --delete-file TEXT             Delete a Files API reference
@@ -390,6 +443,18 @@ Options:
   --version                      Show version
   --help                         Show this message and exit
 ```
+
+### Chunked Workflows (`--timestamp-offset`)
+
+When a long recording is split into chunks and transcribed separately, each chunk's timestamps restart at `00:00`. `--timestamp-offset` tells the model where the chunk sits in the original timeline, so the assembled transcript reads linearly without hand-editing:
+
+```bash
+yt-process ./chunk-02.m4a --timestamp-offset 18:30 -m transcript
+```
+
+### Audio Inputs
+
+Audio files get audio-specific prompts. The video prompts ask for slide descriptions and on-screen text, which invites a model to invent them for an audio-only file. Audio runs emit an `# Audio Analysis` header, no `[SLIDE: ...]` markers, and add a decisions/commitments section. `--fps` and `--media-resolution` are rejected for audio.
 
 ## API Limits
 

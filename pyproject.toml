@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "youtube-gemini-processor"
-version = "0.3.0"
+version = "0.4.0"
 description = "Universal CLI tool to process YouTube videos using Google's Gemini API - extracts transcripts and visual content descriptions"
 readme = "README.md"
 license = "MIT"
@@ -86,4 +86,6 @@ select = ["E", "W", "F", "I", "B", "C4", "UP", "S", "SIM", "RET", "PTH", "RUF"]
 ignore = ["E501", "S310", "S603", "S607", "RET504"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101"]
+# S101: asserts are the point. S108: /tmp paths in tests are string fixtures,
+# never opened.
+"tests/**/*.py" = ["S101", "S108"]

@@ -298,14 +298,20 @@ class TestCalculateCost:
         assert stats.output_cost == 0.40  # $0.40 per 1M output tokens
         assert stats.total_cost == 0.50
 
-    def test_unknown_model_uses_default(self) -> None:
-        """Test unknown models use default pricing (gemini-3.1-pro-preview tiers)."""
-        # 1M input crosses the 200k tier boundary on the default model.
+    def test_unknown_model_reports_tokens_but_no_cost(self) -> None:
+        """Unknown models report usage with cost explicitly unknown.
+
+        Borrowing another model's rate card would print a confidently wrong
+        dollar figure, so pricing_known goes False instead.
+        """
         stats = calculate_cost("unknown-model", 1_000_000, 100_000)
-        # input: 200k * $2/M + 800k * $4/M = $0.40 + $3.20 = $3.60
-        assert stats.input_cost == pytest.approx(3.60)
-        # output 100k stays in the first tier ($12/M).
-        assert stats.output_cost == pytest.approx(1.20)
+        assert stats.pricing_known is False
+        assert stats.input_tokens == 1_000_000
+        assert stats.output_tokens == 100_000
+        assert stats.total_tokens == 1_100_000
+        assert stats.input_cost == 0.0
+        assert stats.output_cost == 0.0
+        assert stats.total_cost == 0.0
 
     def test_zero_tokens(self) -> None:
         """Test zero token counts."""
@@ -323,13 +329,25 @@ class TestCalculateCost:
         assert stats.total_cost == pytest.approx(0.90)
 
     def test_gemini_3_1_pro_pricing_crosses_tier(self) -> None:
-        """Above-200k input bills the two tiers proportionally."""
+        """Crossing 200k re-prices EVERY token, input and output.
+
+        Google's rates read "prompts <= 200k" / "prompts > 200k": it is a
+        cliff, not a graduated bracket, and the output rate is chosen by the
+        prompt size too.
+        """
         stats = calculate_cost("gemini-3.1-pro-preview", 300_000, 250_000)
-        # input: 200k * $2/M + 100k * $4/M = $0.40 + $0.40 = $0.80
-        assert stats.input_cost == pytest.approx(0.80)
-        # output: 200k * $12/M + 50k * $18/M = $2.40 + $0.90 = $3.30
-        assert stats.output_cost == pytest.approx(3.30)
-        assert stats.total_cost == pytest.approx(4.10)
+        # input: all 300k * $4/M = $1.20
+        assert stats.input_cost == pytest.approx(1.20)
+        # output: all 250k * $18/M = $4.50
+        assert stats.output_cost == pytest.approx(4.50)
+        assert stats.total_cost == pytest.approx(5.70)
+
+    def test_long_prompt_reprices_even_small_output(self) -> None:
+        """A long prompt lifts the output rate regardless of output size."""
+        short = calculate_cost("gemini-3.1-pro-preview", 200_000, 1_000)
+        long = calculate_cost("gemini-3.1-pro-preview", 200_001, 1_000)
+        assert short.output_cost == pytest.approx(0.012)  # $12/M
+        assert long.output_cost == pytest.approx(0.018)  # $18/M
 
     def test_flat_tier_model_unchanged(self) -> None:
         """Models with a flat (single-tier) rate still bill linearly."""
@@ -1162,8 +1180,9 @@ class TestCLISegmentsMode:
             ],
         )
 
-        # Should not crash with UnboundLocalError, should show error in output
-        assert result.exit_code == 0
+        # Should not crash with UnboundLocalError, should show error in output,
+        # and must exit non-zero so callers can detect the failure.
+        assert result.exit_code == 1
         assert "Error" in result.output
 
 
@@ -1680,8 +1699,19 @@ class TestBuildMediaPart:
         assert "video_metadata" not in call_kwargs
 
     @patch("google.genai.types")
-    def test_audio_part_honors_clip(self, mock_types: MagicMock) -> None:
-        """Audio parts should still attach start/end offsets via VideoMetadata."""
+    def test_audio_part_never_attaches_video_metadata(
+        self, mock_types: MagicMock
+    ) -> None:
+        """Audio parts must NOT carry clip offsets.
+
+        This test previously asserted the opposite. The API accepts
+        VideoMetadata on an audio part and then silently ignores it: measured
+        on Vertex, clipping a two-word audio file to either half returned the
+        whole file with an identical audio token count, over both inline and
+        gs:// transports. Attaching it produced a full-file transcript that
+        the caller believed was a clip. Audio clipping is done by trimming the
+        media with ffmpeg before upload instead (see trim_audio_clip).
+        """
         build_media_part(
             "gs://bucket/recording.mp3",
             "audio/mpeg",
@@ -1690,9 +1720,8 @@ class TestBuildMediaPart:
             clip_end="90s",
         )
 
-        mock_types.VideoMetadata.assert_called_once_with(
-            start_offset="30s", end_offset="90s"
-        )
+        mock_types.VideoMetadata.assert_not_called()
+        assert "video_metadata" not in mock_types.Part.call_args[1]
 
 
 class TestBuildGenerateConfig:

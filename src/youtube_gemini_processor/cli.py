@@ -519,19 +519,18 @@ def select_prompt(mode: str, kind: MediaKind = "video") -> str:
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
 
 # Pricing per 1M tokens (https://ai.google.dev/gemini-api/docs/pricing).
-# Each "input"/"output" entry is either a flat float (per-1M-token rate, used
-# by models with a single tier) or a list of (upper_bound, price) tuples for
-# tiered pricing. Tokens are billed proportionally: tokens in the range
-# [previous_bound, upper_bound) are charged at `price`, and the final tuple
-# must use `None` as upper_bound to cover everything above the last tier.
-# For example, gemini-3.1-pro-preview charges $2/$12 per 1M tokens for the
-# first 200k tokens and $4/$18 above that — captured here as tier tables so
-# calculate_cost() reports the actual billed amount for long-context runs.
 #
-# "audio_input" is an optional override applied to the portion of input tokens
-# Gemini reports under the AUDIO modality, which several models bill at 2-3x
-# the text/video rate. No model currently has both an audio rate and tiered
-# input, so calculate_cost() walks tiers on the non-audio remainder.
+# "input"/"output" are the standard per-1M-token rates. "audio_input" is an
+# optional override for the portion of input tokens Gemini reports under the
+# AUDIO modality, which several models bill at 2-3x the text/video rate.
+#
+# "long_context_threshold" marks models whose rates change on long prompts.
+# This is a CLIFF, not a graduated bracket: Google states the rates as
+# "$1.25, prompts <= 200k tokens" / "$2.50, prompts > 200k tokens", so once the
+# prompt crosses the threshold every token bills at "long_input", and output
+# bills at "long_output" — selected by the PROMPT size, not the output size.
+# Billing the first 200k cheaply and only the excess at the high rate would
+# under-report the bill on any long-context run.
 #
 # This table is pricing data only — it is NOT an allow-list. Any model string
 # is accepted by --model; unknown models simply report no cost estimate.
@@ -540,12 +539,18 @@ MODEL_PRICING: dict[str, dict] = {
     # 2026-08; there is no 3.5/3.6 Pro in the API yet. gemini-2.5-pro is the
     # stable fallback for when a preview model is retired or rate-limited.
     "gemini-3.1-pro-preview": {
-        "input": [(200_000, 2.00), (None, 4.00)],
-        "output": [(200_000, 12.00), (None, 18.00)],
+        "input": 2.00,
+        "output": 12.00,
+        "long_context_threshold": 200_000,
+        "long_input": 4.00,
+        "long_output": 18.00,
     },
     "gemini-2.5-pro": {
-        "input": [(200_000, 1.25), (None, 2.50)],
-        "output": [(200_000, 10.00), (None, 15.00)],
+        "input": 1.25,
+        "output": 10.00,
+        "long_context_threshold": 200_000,
+        "long_input": 2.50,
+        "long_output": 15.00,
     },
     # Flash tier, newest first.
     "gemini-3.6-flash": {"input": 1.50, "output": 7.50},
@@ -604,28 +609,35 @@ SEGMENTS_SCHEMA = {
 }
 
 
-def _tier_cost(
-    tiers: float | int | list[tuple[int | None, float]], tokens: int
-) -> float:
-    """Compute cost for `tokens` against a flat rate or a tier table.
+def _rate_cost(rate: float, tokens: int) -> float:
+    """Cost of `tokens` at a per-1M-token `rate`."""
+    return (tokens / 1_000_000) * rate
 
-    A flat rate is a single per-1M-token price. A tier table is a list of
-    (upper_bound, price) tuples — tokens within [prev_bound, upper_bound)
-    are billed at `price`, and the final tuple must have `upper_bound=None`
-    so it absorbs any tokens above the last threshold.
+
+def resolve_rates(
+    pricing: dict, input_tokens: int
+) -> tuple[float, float, float | None]:
+    """Pick the input, output, and audio rates for a request.
+
+    Long-context pricing is a cliff, not a graduated bracket. Google's pricing
+    page states the rates as "$1.25, prompts <= 200k tokens" / "$2.50, prompts
+    > 200k tokens" — so once the PROMPT crosses the threshold, *every* token
+    bills at the higher rate, and the output rate is selected by the prompt
+    size too (not by how much output was produced).
+
+    Returns:
+        (input_rate, output_rate, audio_rate) where audio_rate is None when the
+        model has unified input pricing.
     """
-    if isinstance(tiers, (int, float)):
-        return (tokens / 1_000_000) * tiers
+    threshold = pricing.get("long_context_threshold")
+    is_long = threshold is not None and input_tokens > threshold
 
-    cost = 0.0
-    prev_bound = 0
-    for upper, price in tiers:
-        if upper is None or tokens <= upper:
-            cost += ((tokens - prev_bound) / 1_000_000) * price
-            return cost
-        cost += ((upper - prev_bound) / 1_000_000) * price
-        prev_bound = upper
-    return cost
+    if is_long:
+        # No model currently has both a long-context threshold and a separate
+        # audio rate; if one ever does, the long rate governs.
+        return pricing["long_input"], pricing["long_output"], None
+
+    return pricing["input"], pricing["output"], pricing.get("audio_input")
 
 
 def calculate_cost(
@@ -666,16 +678,17 @@ def calculate_cost(
             pricing_known=False,
         )
 
-    audio_rate = pricing.get("audio_input")
+    input_rate, output_rate, audio_rate = resolve_rates(pricing, input_tokens)
+
     if audio_rate is not None and audio_input_tokens:
         audio_tokens = min(audio_input_tokens, input_tokens)
-        input_cost = _tier_cost(audio_rate, audio_tokens) + _tier_cost(
-            pricing["input"], input_tokens - audio_tokens
+        input_cost = _rate_cost(audio_rate, audio_tokens) + _rate_cost(
+            input_rate, input_tokens - audio_tokens
         )
     else:
-        input_cost = _tier_cost(pricing["input"], input_tokens)
+        input_cost = _rate_cost(input_rate, input_tokens)
 
-    output_cost = _tier_cost(pricing["output"], billed_output)
+    output_cost = _rate_cost(output_rate, billed_output)
 
     return UsageStats(
         input_tokens=input_tokens,

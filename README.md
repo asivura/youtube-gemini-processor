@@ -269,8 +269,12 @@ yt-process "https://www.youtube.com/watch?v=VIDEO_ID" --prompt "List all tools, 
 | `gemini-3.5-flash` | stable | $1.50 / $9.00 | Previous Flash generation |
 | `gemini-2.5-pro` | stable | $1.25 / $10 (≤200k), $2.50 / $15 above | Stable Pro fallback if the preview model is retired |
 | `gemini-3.5-flash-lite` | stable | $0.30 / $2.50 | Cheap, current |
-| `gemini-3.1-flash-lite` | stable | $0.25 / $1.50 | Cheapest 3.x |
+| `gemini-3.1-flash-lite` | stable, **shuts down 7 May 2027** | $0.25 / $1.50 | Cheapest 3.x, but migrate to `gemini-3.5-flash-lite` |
 | `gemini-2.5-flash-lite` | stable | $0.10 / $0.40 | Cheapest overall; bulk transcription |
+
+Pro models above 200k-token prompts bill at $4 / $18 (`gemini-3.1-pro-preview`) and $2.50 / $15 (`gemini-2.5-pro`). See [Cost Reporting](#cost-reporting).
+
+`gemini-3.1-flash-lite` is the **only** model here with an announced retirement ([deprecations](https://ai.google.dev/gemini-api/docs/deprecations)). Worth noting the intuition is backwards: the preview models have no announced shutdown date, while this stable one does.
 
 ```bash
 yt-process "./video.mp4" --model gemini-3.6-flash        # Newest Flash
@@ -283,7 +287,8 @@ yt-process "./video.mp4" --model gemini-2.5-flash-lite   # Cheapest
 
 **Migration note** — scripts pinned to a removed model should switch to:
 
-- `gemini-2.0-flash` / `gemini-2.0-flash-lite` → `gemini-3.1-flash-lite`
+- `gemini-2.0-flash` / `gemini-2.0-flash-lite` → `gemini-3.5-flash-lite`
+- `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite` (before 7 May 2027)
 - `gemini-3-pro-preview` → `gemini-3.1-pro-preview`
 - `gemini-3-flash-preview` → `gemini-3.6-flash`
 
@@ -293,7 +298,7 @@ The usage line printed with every run reflects what Google actually bills:
 
 - **Thinking tokens count as output.** Gemini reports reasoning tokens separately from the visible answer, but bills them at the output rate. They are folded into the output figure and also broken out, so a run showing `262 output (incl. 242 thinking)` is telling you 92% of your output spend was reasoning. Cap it with `--thinking-level low`.
 - **Audio input bills at its own rate** on several models (up to 3x text/video). The per-modality split is read from the response and priced accordingly.
-- **Tiered pricing is walked properly.** Pro models charge more above 200k tokens; the tier table bills each range at its own rate. To stay under the threshold on long videos, use `--media-resolution low` or a lower `--fps`.
+- **Long-context pricing is a cliff, not a bracket.** Google prices Pro models as "prompts <= 200k tokens" vs "prompts > 200k tokens". Crossing the threshold re-prices **every** token, and the *output* rate is selected by the prompt size too. On `gemini-3.1-pro-preview` a 200,001-token prompt costs 2x on input and 1.5x on output versus a 200,000-token one, so trimming a long video just under the line with `--media-resolution low` or a lower `--fps` is worth real money.
 - **Unknown models report no cost** rather than borrowing another model's rate card.
 
 ### Vertex AI and Local Files

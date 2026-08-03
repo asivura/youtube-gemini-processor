@@ -329,13 +329,25 @@ class TestCalculateCost:
         assert stats.total_cost == pytest.approx(0.90)
 
     def test_gemini_3_1_pro_pricing_crosses_tier(self) -> None:
-        """Above-200k input bills the two tiers proportionally."""
+        """Crossing 200k re-prices EVERY token, input and output.
+
+        Google's rates read "prompts <= 200k" / "prompts > 200k": it is a
+        cliff, not a graduated bracket, and the output rate is chosen by the
+        prompt size too.
+        """
         stats = calculate_cost("gemini-3.1-pro-preview", 300_000, 250_000)
-        # input: 200k * $2/M + 100k * $4/M = $0.40 + $0.40 = $0.80
-        assert stats.input_cost == pytest.approx(0.80)
-        # output: 200k * $12/M + 50k * $18/M = $2.40 + $0.90 = $3.30
-        assert stats.output_cost == pytest.approx(3.30)
-        assert stats.total_cost == pytest.approx(4.10)
+        # input: all 300k * $4/M = $1.20
+        assert stats.input_cost == pytest.approx(1.20)
+        # output: all 250k * $18/M = $4.50
+        assert stats.output_cost == pytest.approx(4.50)
+        assert stats.total_cost == pytest.approx(5.70)
+
+    def test_long_prompt_reprices_even_small_output(self) -> None:
+        """A long prompt lifts the output rate regardless of output size."""
+        short = calculate_cost("gemini-3.1-pro-preview", 200_000, 1_000)
+        long = calculate_cost("gemini-3.1-pro-preview", 200_001, 1_000)
+        assert short.output_cost == pytest.approx(0.012)  # $12/M
+        assert long.output_cost == pytest.approx(0.018)  # $18/M
 
     def test_flat_tier_model_unchanged(self) -> None:
         """Models with a flat (single-tier) rate still bill linearly."""

@@ -229,7 +229,9 @@ Priority order:
 
 `--model` takes **any** string. `MODEL_PRICING` is pricing data, not an allow-list: an unknown model still runs, and `calculate_cost()` returns `pricing_known=False` with zeroed costs rather than borrowing another model's rates. Adding a model to `MODEL_PRICING` (and `SUGGESTED_MODELS`) only enables cost reporting.
 
-Entry shape: `input`/`output` are a flat float (USD per 1M tokens) or a tier table of `(upper_bound, price)` tuples ending in `(None, price)`. Optional `audio_input` overrides `input` for tokens Gemini reports under the AUDIO modality.
+Entry shape: `input`/`output` are per-1M-token rates in USD. Optional `audio_input` overrides `input` for tokens Gemini reports under the AUDIO modality. Optional `long_context_threshold` + `long_input` + `long_output` describe long-prompt pricing.
+
+**Long-context pricing is a cliff, not a graduated bracket.** Google states the rates as "prompts <= 200k tokens" / "prompts > 200k tokens": once the *prompt* crosses the threshold, every token bills at the long rate, and the output rate is selected by the prompt size rather than the output size. `resolve_rates()` owns this. Do not reintroduce proportional bracket-walking — it under-reports any long-context run (a 1M-input / 100k-output `gemini-2.5-pro` call is $4.00, not the $3.25 bracket math produces), and because output caps at 65,536 tokens it would make the high output rate unreachable dead code.
 
 As of August 2026 the frontier Pro model is `gemini-3.1-pro-preview` (the default). **There is no Gemini 3.5 or 3.6 Pro** — the 3.5/3.6 releases are Flash-tier only, and 3.5 Pro has never reached the public API. `gemini-2.5-pro` is carried as the stable fallback because the default is a preview model and preview models get retired on short notice.
 

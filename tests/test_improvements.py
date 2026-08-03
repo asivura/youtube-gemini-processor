@@ -130,11 +130,27 @@ class TestCostAccuracy:
         )
         assert stats.input_cost == pytest.approx(1.50)
 
-    def test_tiered_pricing_still_walks_tiers(self) -> None:
+    def test_long_context_reprices_all_tokens(self) -> None:
+        """Long-context pricing is a cliff, not a graduated bracket.
+
+        Google bills "prompts > 200k tokens" at the high rate for every token,
+        and picks the output rate from the prompt size. Billing only the excess
+        at the high rate under-reports the bill by ~19% on this input.
+        """
         stats = calculate_cost("gemini-2.5-pro", 1_000_000, 100_000)
-        # 200k @ $1.25/M + 800k @ $2.50/M
-        assert stats.input_cost == pytest.approx(0.25 + 2.00)
-        assert stats.output_cost == pytest.approx(1.00)
+        assert stats.input_cost == pytest.approx(2.50)  # all 1M @ $2.50/M
+        assert stats.output_cost == pytest.approx(1.50)  # all 100k @ $15/M
+        assert stats.total_cost == pytest.approx(4.00)
+
+    def test_short_context_uses_base_rates(self) -> None:
+        stats = calculate_cost("gemini-2.5-pro", 100_000, 10_000)
+        assert stats.input_cost == pytest.approx(0.125)  # $1.25/M
+        assert stats.output_cost == pytest.approx(0.10)  # $10/M
+
+    def test_thinking_tokens_do_not_trigger_long_context(self) -> None:
+        """The threshold keys off the prompt, not total or output tokens."""
+        stats = calculate_cost("gemini-2.5-pro", 1_000, 10_000, thoughts_tokens=500_000)
+        assert stats.output_cost == pytest.approx(510_000 / 1_000_000 * 10.00)
 
     def test_cached_tokens_are_reported(self) -> None:
         stats = calculate_cost("gemini-3.6-flash", 1000, 10, cached_tokens=800)

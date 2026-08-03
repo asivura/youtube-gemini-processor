@@ -33,8 +33,10 @@ Examples:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1460,12 +1462,32 @@ def _require_developer_api(client, feature: str) -> None:
         )
 
 
+def gcs_object_name(local_path: Path) -> str:
+    """Build a collision-free object name for a staged local file.
+
+    The bare basename is not safe: a batch containing two different
+    `recording.m4a` files from different directories would map both to the
+    same object, and `gcloud storage cp` overwrites silently — so one input
+    would be analyzed against the other's bytes. Prefixing with a short digest
+    of the absolute path keeps distinct sources distinct while staying
+    deterministic, so re-running the same file reuses one object instead of
+    littering the bucket.
+    """
+    digest = hashlib.sha256(str(local_path).encode("utf-8")).hexdigest()[:12]
+    return f"yt-process/{digest}/{local_path.name}"
+
+
 def upload_to_gcs(local_path: Path, bucket: str, verbose: bool = False) -> str:
     """Upload a local file to GCS via the gcloud CLI and return its gs:// URI.
 
     Shells out to `gcloud storage cp` so the tool inherits the same ADC
     session Vertex already uses, and so google-cloud-storage stays out of the
     dependency set.
+
+    The uploaded object PERSISTS. Nothing in this tool deletes it, and unlike
+    the Files API (48h expiry) GCS has no default TTL, so staging a
+    confidential recording leaves a permanent plaintext copy in the bucket.
+    Callers should prefer the inline path whenever the file is small enough.
     """
     if not shutil.which("gcloud"):
         raise click.ClickException(
@@ -1473,7 +1495,10 @@ def upload_to_gcs(local_path: Path, bucket: str, verbose: bool = False) -> str:
         )
 
     prefix = bucket.removeprefix("gs://").strip("/")
-    gcs_uri = f"gs://{prefix}/{local_path.name}"
+    if not prefix:
+        raise click.ClickException(f"--gcs-bucket is not a usable bucket: {bucket!r}")
+
+    gcs_uri = f"gs://{prefix}/{gcs_object_name(local_path)}"
 
     if verbose:
         click.echo(f"  Uploading {local_path.name} to {gcs_uri}...", err=True)
@@ -1489,7 +1514,10 @@ def upload_to_gcs(local_path: Path, bucket: str, verbose: bool = False) -> str:
             f"Upload to {gcs_uri} failed: {result.stderr.strip()[:400]}"
         )
 
-    click.echo(f"  Uploaded: {gcs_uri}", err=True)
+    click.echo(
+        f"  Uploaded (persists until you delete it): {gcs_uri}",
+        err=True,
+    )
     return gcs_uri
 
 
@@ -1534,14 +1562,24 @@ RETRY_BASE_DELAY_SECONDS = 2.0
 def _is_retryable(exc: Exception) -> bool:
     """Return True if an API exception is worth retrying."""
     code = getattr(exc, "code", None)
-    if isinstance(code, int) and code in RETRYABLE_STATUS_CODES:
-        return True
-    # Fall back to matching the status string for SDK versions that surface the
-    # code only in the message body.
+    if isinstance(code, int):
+        # An explicit status code is authoritative in both directions: a 400
+        # whose message happens to contain the word "UNAVAILABLE" must not be
+        # retried, and retrying re-sends the whole inline payload.
+        return code in RETRYABLE_STATUS_CODES
+
+    # Fall back to the status string only when no code is exposed, and anchor
+    # on the canonical "<CODE> <STATUS>" prefix the SDK emits rather than
+    # searching the entire message body.
     text = str(exc).upper()
     return any(
-        marker in text
-        for marker in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "DEADLINE_EXCEEDED")
+        re.search(rf"\b(?:{code_re})\b\s+{marker}", text)
+        for code_re, marker in (
+            (r"429", "RESOURCE_EXHAUSTED"),
+            (r"503", "UNAVAILABLE"),
+            (r"504", "DEADLINE_EXCEEDED"),
+            (r"500", "INTERNAL"),
+        )
     )
 
 
@@ -1569,7 +1607,10 @@ def generate_with_retry(
         except Exception as exc:
             if attempt >= max_retries or not _is_retryable(exc):
                 raise
+            # Jitter keeps parallel workers that hit the same quota wall from
+            # retrying in lockstep.
             delay = RETRY_BASE_DELAY_SECONDS * (2**attempt)
+            delay *= random.uniform(0.75, 1.25)  # noqa: S311 - backoff, not crypto
             attempt += 1
             if verbose:
                 click.echo(
@@ -1661,7 +1702,9 @@ def get_video_duration(file_path: str) -> str | None:
             return None
         seconds = float(result.stdout.strip())
         return _format_duration(seconds)
-    except (ValueError, OSError):
+    except (ValueError, OSError, subprocess.SubprocessError):
+        # TimeoutExpired is a SubprocessError, NOT an OSError: without it a slow
+        # ffprobe escapes this helper and aborts the whole run.
         return None
 
 
@@ -1717,7 +1760,9 @@ def get_video_duration_gcs(gcs_uri: str) -> str | None:
             return None
         seconds = float(result.stdout.strip())
         return _format_duration(seconds)
-    except (ValueError, OSError):
+    except (ValueError, OSError, subprocess.SubprocessError):
+        # TimeoutExpired is a SubprocessError, NOT an OSError: without it a slow
+        # ffprobe escapes this helper and aborts the whole run.
         return None
 
 
@@ -2020,10 +2065,15 @@ def _build_vertex_local_part(
     Small files ride inline in the request. Larger ones are staged to GCS
     when a bucket is configured; otherwise this raises with both options
     spelled out, because the SDK's own error explains neither.
+
+    Inline is preferred even when a bucket is configured. Staging leaves a
+    permanent copy of the media in cloud storage, so a file small enough to
+    ride along in the request should never be persisted as a side effect of
+    having set YT_PROCESS_GCS_BUCKET once.
     """
     file_size_mb = file_size / (1024 * 1024)
 
-    if file_size <= INLINE_MAX_BYTES and not gcs_bucket:
+    if file_size <= INLINE_MAX_BYTES:
         if verbose:
             click.echo(
                 f"  Inlining {path.name} ({file_size_mb:.1f} MB) for Vertex...",
@@ -2587,7 +2637,7 @@ def _process_single_chapter(
         )
 
     formatted = formatter(analysis)
-    out_path.write_text(formatted)
+    out_path.write_text(formatted, encoding="utf-8")
 
     cost_str = f" (${analysis.usage.total_cost:.4f})" if analysis.usage else ""
     msg = f"  [{num}/{total_chapters}] {title} ({start} - {end or 'end'}){cost_str}"
@@ -2956,12 +3006,12 @@ def _handle_output(
         # Batch mode: write each to separate file
         filename = f"{get_safe_filename(video_input)}.{extension}"
         file_path = output_dir_path / filename
-        file_path.write_text(formatted)
+        file_path.write_text(formatted, encoding="utf-8")
         if verbose:
             click.echo(f"  Saved to: {file_path}")
     elif output_file and not is_batch:
         # Single file output
-        output_file.write_text(formatted)
+        output_file.write_text(formatted, encoding="utf-8")
         if verbose:
             click.echo(f"Saved to: {output_file}")
     elif not output_dir_path and not output_file:
@@ -3035,7 +3085,7 @@ def _handle_output(
 )
 @click.option(
     "--max-retries",
-    type=int,
+    type=click.IntRange(0, 10),
     default=3,
     help="Retries for rate limits and transient server errors (default: 3).",
 )
@@ -3094,9 +3144,10 @@ def _handle_output(
 )
 @click.option(
     "--workers",
-    type=int,
+    type=click.IntRange(1, 32),
     default=4,
-    help="Number of parallel workers for --split with YouTube URLs (default: 4).",
+    help="Parallel workers for --split and for batch mode writing to a "
+    "directory (default: 4). Each in-flight local file is held in memory.",
 )
 @click.option(
     "--upload-only",
@@ -3378,7 +3429,7 @@ def main(
         batch_path = Path(batch)
         inputs = [
             line.strip()
-            for line in batch_path.read_text().splitlines()
+            for line in batch_path.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
         if verbose:
@@ -3549,6 +3600,26 @@ def main(
 
     results: list[VideoAnalysis] = []
 
+    def analyze_safely(video_input: str) -> VideoAnalysis:
+        """Run one input, turning any escaping exception into a failed result.
+
+        The process_* functions capture their own errors, but analyze() can
+        raise before reaching them (backend guards, a prompt whose braces break
+        .format(), an ffprobe timeout). Letting that propagate out of a batch
+        would discard every sibling's output *after* the API calls had already
+        been made and billed, since the executor drains before the exception
+        surfaces. One bad input costs one input.
+        """
+        try:
+            return analyze(video_input)
+        except Exception as exc:
+            return VideoAnalysis(
+                url=video_input,
+                processed_at=datetime.now().isoformat(),
+                model=model,
+                error=str(exc),
+            )
+
     # Parallelize only when each result lands in its own file. Writing several
     # documents to stdout concurrently would interleave them into garbage.
     parallel = is_batch and workers > 1 and output_dir_path is not None
@@ -3560,7 +3631,7 @@ def main(
             f"Processing {len(inputs)} inputs with {workers} workers...", err=True
         )
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(analyze, item): item for item in inputs}
+            futures = {executor.submit(analyze_safely, item): item for item in inputs}
             for done in as_completed(futures):
                 item = futures[done]
                 analysis = done.result()
@@ -3580,7 +3651,9 @@ def main(
             for video_input in progress_inputs:
                 if verbose:
                     click.echo(f"\nProcessing: {video_input}")
-                analysis = analyze(video_input)
+                analysis = (
+                    analyze_safely(video_input) if is_batch else analyze(video_input)
+                )
                 results.append(analysis)
                 finish(video_input, analysis)
 

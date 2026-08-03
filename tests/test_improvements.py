@@ -10,6 +10,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
+from youtube_gemini_processor import cli as cli_module
 from youtube_gemini_processor.cli import (
     AUDIO_PROMPTS,
     DEFAULT_MODEL,
@@ -32,6 +33,7 @@ from youtube_gemini_processor.cli import (
     fetch_youtube_duration,
     format_output_json,
     format_output_markdown,
+    gcs_object_name,
     generate_with_retry,
     is_vertex_client,
     main,
@@ -285,6 +287,27 @@ class TestVertexLocalTransport:
         assert "--clip" in message
         assert "GEMINI_API_KEY" in message
 
+    def test_small_file_stays_inline_even_with_a_bucket_configured(
+        self, tmp_path: Path
+    ) -> None:
+        """Staging persists a permanent copy; a small file must not pay that."""
+        media = tmp_path / "memo.m4a"
+        media.write_bytes(b"\x00" * 2048)
+        with patch("youtube_gemini_processor.cli.upload_to_gcs") as mock_upload:
+            part = _build_vertex_local_part(
+                media,
+                "audio/mp4",
+                "audio",
+                file_size=2048,
+                gcs_bucket="my-bucket",
+                verbose=False,
+                fps=None,
+                clip_start=None,
+                clip_end=None,
+            )
+        mock_upload.assert_not_called()
+        assert part.inline_data is not None
+
     def test_bucket_stages_to_gcs(self, tmp_path: Path) -> None:
         media = tmp_path / "big.mp4"
         media.write_bytes(b"")
@@ -337,8 +360,9 @@ class TestUploadToGcs:
             ) as run,
         ):
             uri = upload_to_gcs(media, "gs://my-bucket/")
-        assert uri == "gs://my-bucket/f.mp4"
-        assert run.call_args[0][0][-1] == "gs://my-bucket/f.mp4"
+        assert uri.startswith("gs://my-bucket/yt-process/")
+        assert uri.endswith("/f.mp4")
+        assert run.call_args[0][0][-1] == uri
 
     def test_failed_upload_raises(self, tmp_path: Path) -> None:
         media = tmp_path / "f.mp4"
@@ -350,6 +374,76 @@ class TestUploadToGcs:
             pytest.raises(click.ClickException, match="permission denied"),
         ):
             upload_to_gcs(media, "bucket")
+
+
+class TestGcsObjectNaming:
+    """A bare basename lets one input be analyzed against another's bytes."""
+
+    def test_same_basename_different_dirs_do_not_collide(self, tmp_path: Path) -> None:
+        a = tmp_path / "monday" / "recording.m4a"
+        b = tmp_path / "tuesday" / "recording.m4a"
+        assert gcs_object_name(a) != gcs_object_name(b)
+
+    def test_name_is_deterministic(self, tmp_path: Path) -> None:
+        """Re-running the same file reuses one object instead of littering."""
+        media = tmp_path / "a.m4a"
+        assert gcs_object_name(media) == gcs_object_name(media)
+
+    def test_basename_is_preserved_for_readability(self, tmp_path: Path) -> None:
+        assert gcs_object_name(tmp_path / "standup.m4a").endswith("/standup.m4a")
+
+    def test_empty_bucket_is_rejected(self, tmp_path: Path) -> None:
+        media = tmp_path / "f.mp4"
+        media.write_bytes(b"")
+        with (
+            patch("youtube_gemini_processor.cli.shutil.which", return_value="/g"),
+            pytest.raises(click.ClickException, match="not a usable bucket"),
+        ):
+            upload_to_gcs(media, "gs://")
+
+
+class TestBatchFailureIsolation:
+    """One bad input must not discard an already-billed batch."""
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_one_raising_input_does_not_lose_the_others(
+        self, mock_client: MagicMock, tmp_path: Path
+    ) -> None:
+        client = MagicMock()
+        client.vertexai = False
+        response = MagicMock()
+        response.text = "body"
+        response.usage_metadata = _usage_meta(prompt=10, candidates=5)
+        response.candidates = []
+        client.models.generate_content.return_value = response
+        mock_client.return_value = client
+
+        batch = tmp_path / "inputs.txt"
+        batch.write_text(
+            "https://youtube.com/watch?v=aaa\n"
+            "https://youtube.com/watch?v=bbb\n"
+            "https://youtube.com/watch?v=ccc\n"
+        )
+        outdir = tmp_path / "out"
+
+        real = cli_module.build_duration_line
+
+        def explode(video_input, **kwargs):
+            if "bbb" in video_input:
+                raise RuntimeError("ffprobe blew up")
+            return real(video_input, **kwargs)
+
+        with patch("youtube_gemini_processor.cli.build_duration_line", explode):
+            result = CliRunner().invoke(
+                main,
+                ["--batch", str(batch), "-o", str(outdir), "--api-key", "k"],
+            )
+
+        # The failure is reported and the exit code reflects it...
+        assert result.exit_code == 1
+        # ...but the two healthy inputs still produced their documents.
+        written = sorted(p.name for p in outdir.glob("*.md"))
+        assert len(written) == 3, written
 
 
 class TestRetry:
@@ -369,7 +463,27 @@ class TestRetry:
             client, model="m", contents=[], config=None, sleep=slept.append
         )
         assert result == "ok"
-        assert slept == [2.0, 4.0]
+        # Exponential, but jittered so parallel workers do not retry in lockstep.
+        assert len(slept) == 2
+        assert 1.5 <= slept[0] <= 2.5
+        assert 3.0 <= slept[1] <= 5.0
+        assert slept[1] > slept[0]
+
+    def test_explicit_status_code_overrides_message_text(self) -> None:
+        """A 400 whose body mentions UNAVAILABLE must not be retried.
+
+        Retrying re-sends the entire inline payload, so a false positive here
+        is expensive as well as pointless.
+        """
+        error = Exception("400 INVALID_ARGUMENT: service UNAVAILABLE in region")
+        error.code = 400
+        client = MagicMock()
+        client.models.generate_content.side_effect = error
+        with pytest.raises(Exception, match="INVALID_ARGUMENT"):
+            generate_with_retry(
+                client, model="m", contents=[], config=None, sleep=lambda _: None
+            )
+        assert client.models.generate_content.call_count == 1
 
     def test_gives_up_after_budget(self) -> None:
         error = Exception("503 UNAVAILABLE")

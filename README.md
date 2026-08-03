@@ -307,8 +307,10 @@ Vertex AI has **no Files API** — `client.files.upload()` raises there. Local f
 
 | File size | Transport |
 |-----------|-----------|
-| ≤ 20 MB | Sent inline in the request, no staging |
+| ≤ 20 MB | Sent inline in the request, nothing persisted |
 | > 20 MB | Staged to GCS via `--gcs-bucket` (needs the `gcloud` CLI) |
+
+> **Staged objects persist.** Nothing in this tool deletes them, and unlike the Files API (48h expiry) GCS has no default TTL, so staging a confidential recording leaves a permanent plaintext copy in the bucket. Use a bucket you control, set a [lifecycle rule](https://cloud.google.com/storage/docs/lifecycle) to auto-delete, and check the bucket is not public. Files under the inline limit are **never** staged, even with a bucket configured.
 
 ```bash
 yt-process ./voice-memo.m4a --vertex                            # inline, just works

@@ -101,6 +101,10 @@ Vertex AI has no Files API — `client.files.upload()` raises `ValueError: This 
 | > 20 MB with `--gcs-bucket` | Staged via `gcloud storage cp`, then `gs://` URI | `upload_to_gcs()` |
 | > 20 MB without a bucket | `ClickException` listing all four options | `_build_vertex_local_part()` |
 
+Inline is preferred **even when a bucket is configured** — staging persists a plaintext copy of the media forever (no TTL, no cleanup path), so a small file must never be uploaded just because `YT_PROCESS_GCS_BUCKET` happens to be set. Staged objects are named `yt-process/<sha256(abspath)[:12]>/<basename>` via `gcs_object_name()`: a bare basename would let two same-named files from different directories overwrite each other, and `gcloud storage cp` overwrites silently, so one input would be analyzed against another's bytes.
+
+20 MB is a deliberately conservative constant, not a hard API ceiling — Vertex was measured accepting 30 MB raw (41 MB base64) inline. Do not raise it without re-measuring; the value also bounds peak memory, since serialization holds roughly 5x the file size per in-flight request and `--workers` multiplies that.
+
 `is_vertex_client()` compares `client.vertexai is True` (not truthiness) so stubs and mocks never take the Vertex path. `_require_developer_api()` guards `--upload-only`, `--list-files`, `--delete-file`, and `files/` inputs with an actionable message.
 
 ### GCS Processing (Vertex AI)

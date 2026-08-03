@@ -493,6 +493,110 @@ class TestModelCapabilityGuards:
         client.models.generate_content.assert_not_called()
 
 
+class TestRetryabilityAcrossBackends:
+    """Tightening on status codes must not strip retries from other backends."""
+
+    def test_litellm_gateway_errors_carry_a_retryable_code(self) -> None:
+        """ClickException has exit_code, not code; the adapter must set .code."""
+        for status in (429, 500, 503, 504):
+            err = click.ClickException(f"LiteLLM request failed ({status}): body")
+            err.code = status
+            assert cli_module._is_retryable(err) is True
+
+    def test_litellm_client_error_is_not_retryable(self) -> None:
+        err = click.ClickException("LiteLLM request failed (400): bad request")
+        err.code = 400
+        assert cli_module._is_retryable(err) is False
+
+    def test_transport_faults_are_retryable(self) -> None:
+        """A blip mid-POST of a 20 MB payload is exactly what retries are for."""
+        import httpx
+
+        for exc in (
+            httpx.ReadTimeout("timeout"),
+            httpx.ConnectError("refused"),
+            ConnectionResetError("reset"),
+            TimeoutError("slow"),
+        ):
+            assert cli_module._is_retryable(exc) is True
+
+
+class TestEmptyResponseIsFailure:
+    def test_empty_text_raises_rather_than_writing_a_blank_document(self) -> None:
+        """A gateway returning content:null became "" and exited 0."""
+        client = MagicMock()
+        client.vertexai = False
+        response = MagicMock()
+        response.text = ""
+        response.usage_metadata = _usage_meta(prompt=500_000, candidates=0)
+        response.candidates = []
+        client.models.generate_content.return_value = response
+
+        from google.genai import types
+
+        analysis = VideoAnalysis(url="u")
+        media_part = types.Part(
+            file_data=types.FileData(file_uri="gs://b/x.mp4", mime_type="video/mp4")
+        )
+        with pytest.raises(click.ClickException, match="no text content"):
+            cli_module._call_gemini_and_parse(
+                client, media_part, "gemini-3.6-flash", "p", analysis
+            )
+
+    def test_error_document_still_reports_billed_usage(self) -> None:
+        analysis = VideoAnalysis(url="u", error="blocked")
+        analysis.usage = calculate_cost("gemini-3.6-flash", 500_000, 0)
+        out = format_output_markdown(analysis)
+        assert "500,000 input" in out
+
+
+class TestTimestampSuffixParsing:
+    """ "1:30s" mixes two documented spellings and used to crash."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("90", "90s"),
+            ("90s", "90s"),
+            ("1:30", "90s"),
+            ("1:30s", "90s"),
+            ("0:01:30", "90s"),
+            ("0:01:30s", "90s"),
+        ],
+    )
+    def test_parses_without_raising(self, value: str, expected: str) -> None:
+        assert cli_module.parse_timestamp_to_seconds(value) == expected
+
+    def test_result_is_always_int_parseable(self) -> None:
+        """Callers do int(x.rstrip('s')); that must never blow up."""
+        for value in ("90s", "1:30s", "0:01:30"):
+            int(cli_module.parse_timestamp_to_seconds(value).rstrip("s"))
+
+    def test_garbage_still_raises_a_clean_error(self) -> None:
+        with pytest.raises(click.ClickException, match="Invalid timestamp"):
+            cli_module.parse_timestamp_to_seconds("not-a-time")
+
+
+class TestOutputCollisions:
+    def test_same_basename_from_different_dirs_both_survive(
+        self, tmp_path: Path
+    ) -> None:
+        """Previously the second write silently overwrote the first."""
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+        for src in ("/a/talk.mp4", "/b/talk.mp4"):
+            cli_module._handle_output(
+                f"doc for {src}", src, "md", outdir, None, True, False
+            )
+        written = sorted(p.name for p in outdir.glob("*.md"))
+        assert len(written) == 2, written
+
+    def test_split_totals_do_not_claim_zero_for_unpriced_models(self) -> None:
+        total = UsageStats()
+        total.pricing_known &= calculate_cost("future-model", 10, 5).pricing_known
+        assert total.pricing_known is False
+
+
 class TestAudioClipping:
     """The API accepts and then silently ignores clip offsets on audio."""
 

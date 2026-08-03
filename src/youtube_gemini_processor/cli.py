@@ -940,9 +940,14 @@ class _LiteLLMModels:
             json=payload,
         )
         if resp.status_code != 200:
-            raise click.ClickException(
+            error = click.ClickException(
                 f"LiteLLM request failed ({resp.status_code}): {resp.text[:500]}"
             )
+            # generate_with_retry reads `.code` to decide retryability.
+            # ClickException carries `exit_code`, not `code`, so without this
+            # a gateway 429 or 503 would never be retried.
+            error.code = resp.status_code
+            raise error
         data = resp.json()
 
         choice = (data.get("choices") or [{}])[0]
@@ -1327,9 +1332,15 @@ def parse_timestamp_to_seconds(timestamp: str) -> str:
     """
     timestamp = timestamp.strip()
 
-    # Already in seconds format
+    # Already in seconds format. Only short-circuit when the body is actually
+    # numeric: "1:30s" is a plausible mix of two documented spellings, and
+    # passing it through unchanged made callers do int("1:30") and blow up
+    # with a raw ValueError traceback instead of a clean message.
     if timestamp.endswith("s"):
-        return timestamp
+        body = timestamp[:-1]
+        if body.isdigit():
+            return timestamp
+        timestamp = body
     if timestamp.isdigit():
         return f"{timestamp}s"
 
@@ -1652,6 +1663,13 @@ RETRY_BASE_DELAY_SECONDS = 2.0
 
 def _is_retryable(exc: Exception) -> bool:
     """Return True if an API exception is worth retrying."""
+    # Transport-level faults never carry a status code but are exactly what a
+    # retry is for — a blip partway through POSTing a 20 MB inline payload.
+    import httpx
+
+    if isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError)):
+        return True
+
     code = getattr(exc, "code", None)
     if isinstance(code, int):
         # An explicit status code is authoritative in both directions: a 400
@@ -1983,7 +2001,11 @@ def _call_gemini_and_parse(
     analysis.finish_reason = finish_reason
 
     text = response.text
-    if text is None:
+    # `not text`, not `is None`: an OpenAI-compatible gateway returning
+    # `content: null` becomes "" on the way through the adapter, and an empty
+    # document is a failure however it arrived. Treating it as success wrote a
+    # blank transcript and exited 0 after billing the full input.
+    if not text:
         detail = f" (finish_reason: {finish_reason})" if finish_reason else ""
         feedback = getattr(response, "prompt_feedback", None)
         if feedback:
@@ -2067,6 +2089,15 @@ def process_local_file(
         # inline_data Part, which the LiteLLM adapter maps to the
         # OpenAI-compatible audio/video content shapes.
         if isinstance(client, LiteLLMClient):
+            if file_size > INLINE_MAX_BYTES:
+                raise click.ClickException(
+                    f"{path.name} is {file_size_mb:.1f} MB, over the "
+                    f"{INLINE_MAX_BYTES // (1024 * 1024)} MB inline limit. The "
+                    "LiteLLM backend has no Files API, so the whole file would "
+                    "be base64-encoded in memory (roughly 5x its size).\n"
+                    "Use --clip for a shorter range, or switch to the Gemini "
+                    "API key (--api-key) or Vertex AI (--vertex) backend."
+                )
             if fps is not None or clip_start is not None or clip_end is not None:
                 click.echo(
                     "Warning: --fps/--clip are ignored on the LiteLLM backend "
@@ -2831,16 +2862,28 @@ def split_youtube_video(
                 total_usage.input_tokens += usage.input_tokens
                 total_usage.output_tokens += usage.output_tokens
                 total_usage.total_tokens += usage.total_tokens
+                total_usage.thoughts_tokens += usage.thoughts_tokens
+                total_usage.audio_input_tokens += usage.audio_input_tokens
+                total_usage.cached_tokens += usage.cached_tokens
                 total_usage.input_cost += usage.input_cost
                 total_usage.output_cost += usage.output_cost
                 total_usage.total_cost += usage.total_cost
+                # One unpriced chapter makes the whole total unknown; printing
+                # $0.0000 would be the confidently-wrong number pricing_known
+                # exists to prevent.
+                total_usage.pricing_known &= usage.pricing_known
 
     # Sort by filename for consistent output
     created_files.sort()
 
+    cost_str = (
+        f"${total_usage.total_cost:.4f}"
+        if total_usage.pricing_known
+        else "cost unknown (unpriced model)"
+    )
     click.echo(
         f"\nProcessed {len(created_files)}/{total} chapters. "
-        f"Total: {total_usage.total_tokens:,} tokens, ${total_usage.total_cost:.4f}",
+        f"Total: {total_usage.total_tokens:,} tokens, {cost_str}",
         err=True,
     )
 
@@ -2906,7 +2949,14 @@ def format_output_markdown(analysis: VideoAnalysis, kind: MediaKind = "video") -
     """Format analysis as markdown."""
     label = "Audio" if kind == "audio" else "Video"
     if analysis.error:
-        return f"# Error Processing {label}\n\n**URL**: {analysis.url}\n\n**Error**: {analysis.error}\n"
+        # Include usage when we have it: a blocked or empty response still
+        # billed for the input, and that is exactly when you want the number.
+        return (
+            f"# Error Processing {label}\n\n"
+            f"**URL**: {analysis.url}\n\n"
+            f"**Error**: {analysis.error}\n"
+            f"{format_usage_markdown(analysis.usage)}"
+        )
 
     return f"""# {label} Analysis
 
@@ -3106,9 +3156,15 @@ def _handle_output(
 ) -> None:
     """Handle writing formatted output to file or stdout."""
     if output_dir_path:
-        # Batch mode: write each to separate file
-        filename = f"{get_safe_filename(video_input)}.{extension}"
-        file_path = output_dir_path / filename
+        # Batch mode: write each to separate file. The stem alone collides for
+        # same-named files in different directories (a/talk.mp4, b/talk.mp4),
+        # and the second write would silently overwrite the first, so fall
+        # back to a disambiguated name rather than losing a document.
+        base = get_safe_filename(video_input)
+        file_path = output_dir_path / f"{base}.{extension}"
+        if file_path.exists():
+            suffix = hashlib.sha256(video_input.encode("utf-8")).hexdigest()[:8]
+            file_path = output_dir_path / f"{base}-{suffix}.{extension}"
         file_path.write_text(formatted, encoding="utf-8")
         if verbose:
             click.echo(f"  Saved to: {file_path}")
@@ -3509,6 +3565,15 @@ def main(
                 "local path, and --clip will be applied with ffmpeg."
             )
 
+    # Chapter splitting injects its own per-chapter offset, so a global one
+    # would be both redundant and ignored. Rejecting beats accepting a value
+    # and silently discarding it.
+    if timestamp_offset and split:
+        raise click.ClickException(
+            "--timestamp-offset cannot be combined with --split: each chapter "
+            "already gets its own offset from the chapter start time."
+        )
+
     if thinking_level and not supports_thinking_level(model):
         raise click.ClickException(
             f"--thinking-level is not supported by {model}, which rejects it "
@@ -3564,7 +3629,11 @@ def main(
 
     if output:
         output_path = Path(output)
-        if is_batch or output_path.is_dir():
+        # --batch always writes a directory, even for a one-line batch file:
+        # `--batch inputs.txt -o ./output/` is the documented invocation, and
+        # keying on the input count made a single-entry file silently create a
+        # *file* named "output".
+        if batch or is_batch or output_path.is_dir() or output.endswith("/"):
             output_dir_path = output_path
             output_dir_path.mkdir(parents=True, exist_ok=True)
         else:

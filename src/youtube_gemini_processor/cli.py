@@ -40,6 +40,7 @@ import random
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -575,10 +576,22 @@ SUGGESTED_MODELS = [
     "gemini-2.5-flash-lite",
 ]
 
-# Every Gemini 3.x model caps output at 65,536 tokens; 2.5-era models match it.
-# Kept as a lookup so a future model with a different cap is a one-line change.
-DEFAULT_MAX_OUTPUT_TOKENS = 65536
+# 65,535, not 65,536: gemini-2.5-flash-lite validates max_output_tokens against
+# a range that is EXCLUSIVE at the top ("supported range is from 1 (inclusive)
+# to 65536 (exclusive)") and hard-400s the request. 65,535 is accepted by every
+# model in the table, so one value below the boundary avoids a per-model table.
+DEFAULT_MAX_OUTPUT_TOKENS = 65535
 MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {}
+
+
+def supports_thinking_level(model: str) -> bool:
+    """Return True if the model accepts `thinking_level`.
+
+    Gemini 2.5-era models reject it outright ("thinking_level is not supported
+    by this model") and use `thinking_budget` instead. Unknown or future models
+    are assumed to support it, so a new release is not blocked by this list.
+    """
+    return not model.startswith(("gemini-2.", "gemini-1."))
 
 
 def get_max_output_tokens(model: str) -> int:
@@ -809,16 +822,32 @@ class _LiteLLMUsage:
         self.candidates_token_count = completion_tokens
 
 
+class _LiteLLMCandidate:
+    """Stand-in for a genai ``Candidate``, carrying only the finish reason."""
+
+    def __init__(self, finish_reason: str) -> None:
+        self.finish_reason = finish_reason
+
+
 class _LiteLLMResponse:
     """Minimal stand-in for genai's ``GenerateContentResponse``.
 
-    Exposes only what :func:`_call_gemini_and_parse` reads: ``.text`` and
-    ``.usage_metadata``.
+    Exposes what :func:`_call_gemini_and_parse` reads: ``.text``,
+    ``.usage_metadata``, and ``.candidates`` — the last so truncation
+    detection works here too. An OpenAI-shaped gateway reports a clipped
+    response as ``finish_reason == "length"``; without translating that to
+    ``MAX_TOKENS`` a truncated run on this backend would be reported as clean.
     """
 
-    def __init__(self, text: str, usage_metadata: _LiteLLMUsage | None) -> None:
+    def __init__(
+        self,
+        text: str,
+        usage_metadata: _LiteLLMUsage | None,
+        finish_reason: str = "",
+    ) -> None:
         self.text = text
         self.usage_metadata = usage_metadata
+        self.candidates = [_LiteLLMCandidate(finish_reason)] if finish_reason else []
 
 
 class _LiteLLMModels:
@@ -870,6 +899,12 @@ class _LiteLLMModels:
                 "LiteLLM backend (no OpenAI-compatible equivalent).",
                 err=True,
             )
+        if getattr(config, "thinking_config", None) is not None:
+            click.echo(
+                "Warning: --thinking-level is ignored on the LiteLLM backend "
+                "(no OpenAI-compatible equivalent).",
+                err=True,
+            )
 
         user_content: list[dict] = []
         if prompt_text:
@@ -918,7 +953,15 @@ class _LiteLLMModels:
             prompt_tokens=usage_data.get("prompt_tokens", 0) or 0,
             completion_tokens=usage_data.get("completion_tokens", 0) or 0,
         )
-        return _LiteLLMResponse(text=text, usage_metadata=usage)
+
+        # Map the OpenAI finish reason onto the Gemini name the caller checks.
+        choices = data.get("choices") or [{}]
+        raw_finish = choices[0].get("finish_reason") or ""
+        finish_reason = "MAX_TOKENS" if raw_finish == "length" else raw_finish.upper()
+
+        return _LiteLLMResponse(
+            text=text, usage_metadata=usage, finish_reason=finish_reason
+        )
 
 
 class LiteLLMClient:
@@ -1360,12 +1403,22 @@ def _build_video_metadata(
 ):
     """Build VideoMetadata for a media part, or None if nothing to attach.
 
-    `fps` is video-only; clip offsets apply to both audio and video.
+    VIDEO ONLY. `VideoMetadata` on an audio-only part is accepted by the API
+    and then silently ignored: the full file is ingested and billed, and the
+    response covers the whole recording. Measured on Vertex with a 2-word
+    audio file, clipping to either half returned all of it with an identical
+    audio token count over both inline and gs:// transports.
+
+    Audio clipping is therefore done by trimming the media before upload (see
+    `trim_audio_clip`), never by attaching metadata here.
     """
     from google.genai import types
 
+    if kind != "video":
+        return None
+
     vm_kwargs: dict = {}
-    if kind == "video" and fps is not None:
+    if fps is not None:
         vm_kwargs["fps"] = fps
     if clip_start is not None:
         vm_kwargs["start_offset"] = clip_start
@@ -1373,6 +1426,44 @@ def _build_video_metadata(
         vm_kwargs["end_offset"] = clip_end
 
     return types.VideoMetadata(**vm_kwargs) if vm_kwargs else None
+
+
+def trim_audio_clip(
+    path: Path, clip_start: str | None, clip_end: str | None, verbose: bool = False
+) -> Path:
+    """Cut an audio file down to the requested range with ffmpeg.
+
+    Returns a path to a temporary trimmed copy, which the caller is
+    responsible for deleting. The API ignores clip offsets on audio parts, so
+    the trim has to happen locally for `--clip` to mean anything.
+    """
+    if not shutil.which("ffmpeg"):
+        raise click.ClickException(
+            "--clip on audio input requires ffmpeg, which was not found on PATH.\n"
+            "The Gemini API ignores clip offsets on audio, so the file has to be "
+            "trimmed locally. Install ffmpeg, or pre-trim the file yourself."
+        )
+
+    start = int(clip_start.rstrip("s")) if clip_start else 0
+    fd, tmp_name = tempfile.mkstemp(suffix=path.suffix, prefix="yt-process-clip-")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
+    cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(path)]
+    if clip_end is not None:
+        cmd += ["-t", str(int(clip_end.rstrip("s")) - start)]
+    cmd += ["-c", "copy", str(tmp_path)]
+
+    if verbose:
+        click.echo("  Trimming audio to the requested clip range...", err=True)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 or not tmp_path.stat().st_size:
+        tmp_path.unlink(missing_ok=True)
+        raise click.ClickException(
+            f"ffmpeg could not trim {path.name}: {result.stderr.strip()[:300]}"
+        )
+    return tmp_path
 
 
 def build_media_part(
@@ -1958,8 +2049,17 @@ def process_local_file(
         model=model,
     )
 
+    trimmed: Path | None = None
     try:
         mime_type, kind = get_media_mime_type(path)
+
+        # The API ignores clip offsets on audio parts, so trim locally instead
+        # of shipping the whole file and pretending a range was applied.
+        if kind == "audio" and (clip_start is not None or clip_end is not None):
+            trimmed = trim_audio_clip(path, clip_start, clip_end, verbose=verbose)
+            path = trimmed
+            clip_start = clip_end = None
+
         file_size = path.stat().st_size
         file_size_mb = file_size / (1024 * 1024)
 
@@ -2034,7 +2134,7 @@ def process_local_file(
             model,
             prompt,
             analysis,
-            fallback_title=path.stem,
+            fallback_title=Path(analysis.url).stem,
             response_schema=response_schema,
             media_resolution=media_resolution,
             thinking_level=thinking_level,
@@ -2044,6 +2144,9 @@ def process_local_file(
 
     except Exception as e:
         analysis.error = str(e)
+    finally:
+        if trimmed is not None:
+            trimmed.unlink(missing_ok=True)
 
     return analysis
 
@@ -3395,6 +3498,23 @@ def main(
             raise click.ClickException(
                 "--media-resolution is not supported for audio inputs"
             )
+        # Audio clipping is done by trimming the file with ffmpeg before upload,
+        # because the API accepts and then silently ignores clip offsets on
+        # audio. That is only possible for a local file we can read.
+        if clip and not is_local_file(input):
+            raise click.ClickException(
+                "--clip on remote audio is not supported.\n"
+                "The Gemini API silently ignores clip offsets on audio, so the "
+                "file must be trimmed locally first. Download it, or pass a "
+                "local path, and --clip will be applied with ffmpeg."
+            )
+
+    if thinking_level and not supports_thinking_level(model):
+        raise click.ClickException(
+            f"--thinking-level is not supported by {model}, which rejects it "
+            "with a 400. It is available on Gemini 3.x models "
+            f"(e.g. {DEFAULT_MODEL}, gemini-3.6-flash)."
+        )
 
     # Initialize client
     client = get_gemini_client(

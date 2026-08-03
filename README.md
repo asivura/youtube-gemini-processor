@@ -181,7 +181,7 @@ yt-process ./voice-memo.mp3 -m transcript
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
 Supported audio formats: `.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.aac`, `.aiff`, `.aif`
 
-`--fps` and `--media-resolution` are video-only options. Audio inputs still support `--clip` for start/end offsets.
+`--fps` and `--media-resolution` are video-only options. `--clip` works on audio too, but by a different mechanism: the Gemini API accepts and then silently ignores clip offsets on audio parts, so a local audio file is trimmed with ffmpeg before upload. `--clip` on *remote* audio (`gs://`, `files/`) is rejected rather than silently ignored.
 
 ### Files API References
 

@@ -446,6 +446,121 @@ class TestBatchFailureIsolation:
         assert len(written) == 3, written
 
 
+class TestModelCapabilityGuards:
+    """Both of these hard-400 the request; catch them before spending a call."""
+
+    def test_max_output_tokens_is_below_the_exclusive_ceiling(self) -> None:
+        """gemini-2.5-flash-lite rejects 65536: the range excludes its top."""
+        assert cli_module.DEFAULT_MAX_OUTPUT_TOKENS == 65535
+        assert cli_module.get_max_output_tokens("gemini-2.5-flash-lite") < 65536
+
+    @pytest.mark.parametrize(
+        ("model", "supported"),
+        [
+            ("gemini-3.1-pro-preview", True),
+            ("gemini-3.6-flash", True),
+            ("gemini-3.1-flash-lite", True),
+            ("gemini-2.5-pro", False),
+            ("gemini-2.5-flash", False),
+            ("gemini-2.5-flash-lite", False),
+            ("some-future-model", True),  # unknown models stay permitted
+        ],
+    )
+    def test_thinking_level_support(self, model: str, supported: bool) -> None:
+        assert cli_module.supports_thinking_level(model) is supported
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_thinking_level_on_25_model_is_rejected_before_any_api_call(
+        self, mock_client: MagicMock
+    ) -> None:
+        client = MagicMock()
+        client.vertexai = False
+        mock_client.return_value = client
+        result = CliRunner().invoke(
+            main,
+            [
+                "https://youtube.com/watch?v=x",
+                "--api-key",
+                "k",
+                "--model",
+                "gemini-2.5-pro",
+                "--thinking-level",
+                "low",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "not supported by gemini-2.5-pro" in result.output
+        client.models.generate_content.assert_not_called()
+
+
+class TestAudioClipping:
+    """The API accepts and then silently ignores clip offsets on audio."""
+
+    def test_video_metadata_is_never_attached_to_audio(self) -> None:
+        part = build_inline_media_part(
+            b"d", "audio/mp4", kind="audio", clip_start="8s", clip_end="16s"
+        )
+        assert part.video_metadata is None
+
+    def test_video_still_gets_clip_metadata(self) -> None:
+        """Clipping genuinely works for video; do not break it."""
+        part = build_inline_media_part(
+            b"d", "video/mp4", kind="video", clip_start="8s", clip_end="16s"
+        )
+        assert part.video_metadata.start_offset == "8s"
+        assert part.video_metadata.end_offset == "16s"
+
+    def test_trim_requires_ffmpeg(self, tmp_path: Path) -> None:
+        with (
+            patch("youtube_gemini_processor.cli.shutil.which", return_value=None),
+            pytest.raises(click.ClickException, match="requires ffmpeg"),
+        ):
+            cli_module.trim_audio_clip(tmp_path / "a.mp3", "8s", "16s")
+
+    def test_trim_builds_the_right_ffmpeg_range(self, tmp_path: Path) -> None:
+        media = tmp_path / "a.mp3"
+        media.write_bytes(b"x")
+
+        def fake_ffmpeg(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"trimmed")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("youtube_gemini_processor.cli.shutil.which", return_value="/ff"),
+            patch(
+                "youtube_gemini_processor.cli.subprocess.run", side_effect=fake_ffmpeg
+            ) as run,
+        ):
+            out = cli_module.trim_audio_clip(media, "8s", "20s")
+        cmd = run.call_args[0][0]
+        assert cmd[cmd.index("-ss") + 1] == "8"
+        assert cmd[cmd.index("-t") + 1] == "12"  # duration, not end timestamp
+        out.unlink(missing_ok=True)
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_clip_on_remote_audio_is_rejected(self, mock_client: MagicMock) -> None:
+        client = MagicMock()
+        client.vertexai = True
+        mock_client.return_value = client
+        result = CliRunner().invoke(
+            main, ["gs://bucket/call.m4a", "--vertex", "--clip", "1:00-2:00"]
+        )
+        assert result.exit_code != 0
+        assert "trimmed locally" in result.output
+
+
+class TestLiteLLMTruncation:
+    """An OpenAI gateway reports a clipped answer as finish_reason=length."""
+
+    def test_length_maps_to_max_tokens(self) -> None:
+        resp = cli_module._LiteLLMResponse("body", None, finish_reason="MAX_TOKENS")
+        assert resp.candidates[0].finish_reason == "MAX_TOKENS"
+
+    def test_absent_finish_reason_yields_no_candidates(self) -> None:
+        resp = cli_module._LiteLLMResponse("body", None)
+        assert resp.candidates == []
+
+
 class TestRetry:
     def test_returns_first_success(self) -> None:
         client = MagicMock()

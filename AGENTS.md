@@ -69,7 +69,9 @@ Single-module CLI application in `src/youtube_gemini_processor/cli.py`:
 Supported video formats: `.mp4`, `.mpeg`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.mkv`, `.3gp`
 Supported audio formats: `.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.aac`, `.aiff`, `.aif`
 
-`--fps` and `--media-resolution` are video-only and error out if combined with audio input. `--clip` works for both.
+`--fps` and `--media-resolution` are video-only and error out if combined with audio input.
+
+`--clip` is video-only *as an API feature*. `VideoMetadata` on an audio part is accepted and then silently ignored — measured on Vertex, clipping a two-word audio file to either half returned the whole file with an identical audio token count, over both inline and `gs://` transports. `_build_video_metadata()` therefore returns `None` for audio, and `process_local_file()` trims local audio with `trim_audio_clip()` before upload. `--clip` on remote audio is rejected in `main()`. Never re-attach `VideoMetadata` to an audio part: it makes the model return the full recording while the caller believes it got a clip, and with `--timestamp-offset` every emitted timestamp is then wrong.
 
 ### Files API Reuse
 

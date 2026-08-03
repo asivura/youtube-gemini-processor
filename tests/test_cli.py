@@ -1699,8 +1699,19 @@ class TestBuildMediaPart:
         assert "video_metadata" not in call_kwargs
 
     @patch("google.genai.types")
-    def test_audio_part_honors_clip(self, mock_types: MagicMock) -> None:
-        """Audio parts should still attach start/end offsets via VideoMetadata."""
+    def test_audio_part_never_attaches_video_metadata(
+        self, mock_types: MagicMock
+    ) -> None:
+        """Audio parts must NOT carry clip offsets.
+
+        This test previously asserted the opposite. The API accepts
+        VideoMetadata on an audio part and then silently ignores it: measured
+        on Vertex, clipping a two-word audio file to either half returned the
+        whole file with an identical audio token count, over both inline and
+        gs:// transports. Attaching it produced a full-file transcript that
+        the caller believed was a clip. Audio clipping is done by trimming the
+        media with ffmpeg before upload instead (see trim_audio_clip).
+        """
         build_media_part(
             "gs://bucket/recording.mp3",
             "audio/mpeg",
@@ -1709,9 +1720,8 @@ class TestBuildMediaPart:
             clip_end="90s",
         )
 
-        mock_types.VideoMetadata.assert_called_once_with(
-            start_offset="30s", end_offset="90s"
-        )
+        mock_types.VideoMetadata.assert_not_called()
+        assert "video_metadata" not in mock_types.Part.call_args[1]
 
 
 class TestBuildGenerateConfig:

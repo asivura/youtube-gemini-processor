@@ -204,7 +204,10 @@ class TestFetchYoutubeChapters:
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
 
-        assert fetch_youtube_chapters("https://www.youtube.com/watch?v=abc") == []
+        assert fetch_youtube_chapters("https://www.youtube.com/watch?v=nodesc") == []
+        # The page cache is keyed on video id; a shared id let a later test
+        # read this one's HTML and skip its own path entirely.
+        assert mock_urlopen.call_count == 1
 
     @patch("youtube_gemini_processor.cli.urllib.request.urlopen")
     def test_single_chapter_returns_empty(self, mock_urlopen: MagicMock) -> None:
@@ -215,14 +218,18 @@ class TestFetchYoutubeChapters:
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
 
-        assert fetch_youtube_chapters("https://www.youtube.com/watch?v=abc") == []
+        assert fetch_youtube_chapters("https://www.youtube.com/watch?v=onechap") == []
+        assert mock_urlopen.call_count == 1
 
     @patch(
         "youtube_gemini_processor.cli.urllib.request.urlopen",
         side_effect=Exception("network error"),
     )
     def test_network_error_returns_empty(self, mock_urlopen: MagicMock) -> None:
-        assert fetch_youtube_chapters("https://www.youtube.com/watch?v=abc") == []
+        assert fetch_youtube_chapters("https://www.youtube.com/watch?v=neterr") == []
+        # Without this the test passed on a cache hit and never raised at all:
+        # deleting the error guard from the source left it green.
+        assert mock_urlopen.call_count == 1
 
 
 # ---------------------------------------------------------------------------

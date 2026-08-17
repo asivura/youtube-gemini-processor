@@ -52,6 +52,7 @@ from typing import Literal
 
 import click
 import httpx
+from click.core import ParameterSource
 
 
 @dataclass
@@ -520,6 +521,8 @@ def select_prompt(mode: str, kind: MediaKind = "video") -> str:
 
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
+DECKSMITH_DEFAULT_MODEL = "gemini-2.5-pro"
+DECKSMITH_LITELLM_BASE_URL = "https://litellm.anton-dev.pan.run/v1"
 
 # Pricing per 1M tokens (https://ai.google.dev/gemini-api/docs/pricing).
 #
@@ -978,31 +981,68 @@ class LiteLLMClient:
     OpenAI-compatible protocol and is guarded against in ``main()``.
     """
 
-    def __init__(self, base_url: str, api_key: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        credential_source: Literal["explicit", "decksmith", "generic"] = "explicit",
+    ) -> None:
         # Normalize to a bare base (no trailing slash); "/chat/completions"
         # is appended per-request.
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.credential_source = credential_source
         self.http = httpx.Client(timeout=httpx.Timeout(600.0))
         self.models = _LiteLLMModels(self)
 
 
 def _build_litellm_client(base_url: str | None, api_key: str | None) -> LiteLLMClient:
-    """Resolve LiteLLM config (arg → env) and construct the client."""
+    """Resolve LiteLLM config and construct the client without exposing its key."""
+    credential_source: Literal["explicit", "decksmith", "generic"] = "explicit"
+    resolved_key = api_key
+    if not resolved_key:
+        resolved_key = os.environ.get("DECKSMITH_LITELLM_API_KEY")
+        credential_source = "decksmith"
+    if not resolved_key:
+        resolved_key = os.environ.get("LITELLM_API_KEY")
+        credential_source = "generic"
+    if not resolved_key:
+        raise click.ClickException(
+            "LiteLLM backend requires an API key. Set "
+            "DECKSMITH_LITELLM_API_KEY or LITELLM_API_KEY, or pass "
+            "--litellm-api-key"
+        )
+
     resolved_base_url = base_url or os.environ.get("LITELLM_BASE_URL")
+    if not resolved_base_url and credential_source == "decksmith":
+        resolved_base_url = DECKSMITH_LITELLM_BASE_URL
     if not resolved_base_url:
         raise click.ClickException(
             "LiteLLM backend requires a base URL. Set LITELLM_BASE_URL "
             "environment variable or pass --litellm-base-url"
         )
-    resolved_key = api_key or os.environ.get("LITELLM_API_KEY")
-    if not resolved_key:
-        raise click.ClickException(
-            "LiteLLM backend requires an API key. Set LITELLM_API_KEY "
-            "environment variable or pass --litellm-api-key"
-        )
     click.echo(f"Using LiteLLM endpoint ({resolved_base_url})", err=True)
-    return LiteLLMClient(base_url=resolved_base_url, api_key=resolved_key)
+    return LiteLLMClient(
+        base_url=resolved_base_url,
+        api_key=resolved_key,
+        credential_source=credential_source,
+    )
+
+
+def _resolve_model_for_client(
+    model: str, client: object, *, model_was_default: bool
+) -> str:
+    """Use an Anton-supported default without overriding an explicit model."""
+    if (
+        model_was_default
+        and isinstance(client, LiteLLMClient)
+        and client.credential_source == "decksmith"
+    ):
+        click.echo(
+            f"Using {DECKSMITH_DEFAULT_MODEL} (Decksmith Anton default)", err=True
+        )
+        return DECKSMITH_DEFAULT_MODEL
+    return model
 
 
 def _require_files_api_backend(client) -> None:
@@ -1013,6 +1053,28 @@ def _require_files_api_backend(client) -> None:
             "(--upload-only / --list-files / --delete-file). Use the Gemini "
             "API key (--api-key) or Vertex AI (--vertex) backend for these."
         )
+
+
+def _build_vertex_client(project: str | None, location: str | None):
+    """Construct a Vertex client from explicit or tool-specific settings."""
+    from google import genai
+
+    gcp_project = project or os.environ.get("YT_PROCESS_PROJECT")
+    gcp_location = location or os.environ.get("YT_PROCESS_LOCATION") or "global"
+    if not gcp_project:
+        raise click.ClickException(
+            "Vertex AI requires a GCP project. Set YT_PROCESS_PROJECT "
+            "environment variable or pass --project"
+        )
+    click.echo(
+        f"Using Vertex AI (project: {gcp_project}, location: {gcp_location})",
+        err=True,
+    )
+    return genai.Client(
+        vertexai=True,
+        project=gcp_project,
+        location=gcp_location,
+    )
 
 
 def get_gemini_client(
@@ -1031,66 +1093,62 @@ def get_gemini_client(
     1. LiteLLM / OpenAI-compatible endpoint (--litellm flag)
     2. Explicit API key (--api-key flag)
     3. Vertex AI with ADC (--vertex flag) - uses gcloud auth
-    4. Auto-detect Vertex AI if GOOGLE_GENAI_USE_VERTEXAI=true
-    5. Environment variables (GEMINI_API_KEY or GOOGLE_API_KEY)
-    6. Auto-detect LiteLLM if LITELLM_API_KEY is set (last resort)
+    4. Explicit LiteLLM key (--litellm-api-key)
+    5. Decksmith team key (DECKSMITH_LITELLM_API_KEY)
+    6. Environment variables (GEMINI_API_KEY or GOOGLE_API_KEY)
+    7. Auto-detect Vertex AI if GOOGLE_GENAI_USE_VERTEXAI=true
+    8. Generic LITELLM_API_KEY (last resort)
 
     The LiteLLM backend targets any OpenAI-compatible gateway that proxies
-    Gemini models. It supports YouTube URLs and GCS URIs but NOT the Gemini
-    Files API (local uploads, files/* refs) or per-request video metadata
-    (fps/clip/media-resolution).
+    Gemini models. It supports YouTube URLs, GCS URIs, and local files up to
+    the inline size limit, but NOT Gemini Files API operations or ``files/*``
+    refs. Per-request video metadata (fps/clip/media-resolution) is not
+    supported over the OpenAI-compatible protocol.
     """
     from google import genai
 
-    litellm_key = litellm_api_key or os.environ.get("LITELLM_API_KEY")
+    decksmith_key = os.environ.get("DECKSMITH_LITELLM_API_KEY")
+    generic_litellm_key = os.environ.get("LITELLM_API_KEY")
 
     # An explicit --litellm flag takes top priority over every other backend.
     if use_litellm:
-        return _build_litellm_client(litellm_base_url, litellm_key)
+        return _build_litellm_client(litellm_base_url, litellm_api_key)
 
-    # Check if Vertex AI mode is requested or auto-detected
+    # Explicit backend credentials and flags beat environment auto-detection.
+    if api_key:
+        return genai.Client(api_key=api_key)
+
     vertex_env = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
-    use_vertex = use_vertex or vertex_env
 
     if use_vertex:
-        # Vertex AI authentication using Application Default Credentials
-        # Requires: gcloud auth application-default login
-        gcp_project = project or os.environ.get("YT_PROCESS_PROJECT")
-        gcp_location = location or os.environ.get("YT_PROCESS_LOCATION") or "global"
+        return _build_vertex_client(project, location)
 
-        if not gcp_project:
-            raise click.ClickException(
-                "Vertex AI requires a GCP project. Set YT_PROCESS_PROJECT "
-                "environment variable or pass --project"
-            )
+    if litellm_api_key:
+        return _build_litellm_client(litellm_base_url, litellm_api_key)
 
-        click.echo(
-            f"Using Vertex AI (project: {gcp_project}, location: {gcp_location})",
-            err=True,
-        )
+    # A workload-specific team key intentionally beats generic, global auth
+    # environment variables so recording processing charges the team budget.
+    if decksmith_key:
+        return _build_litellm_client(litellm_base_url, None)
 
-        return genai.Client(
-            vertexai=True,
-            project=gcp_project,
-            location=gcp_location,
-        )
-
-    # API key authentication
-    key = (
-        api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    )
+    # Generic environment API-key authentication.
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if key:
         return genai.Client(api_key=key)
 
-    # Last resort: auto-detect the LiteLLM backend from LITELLM_API_KEY.
-    if litellm_key:
-        return _build_litellm_client(litellm_base_url, litellm_key)
+    if vertex_env:
+        return _build_vertex_client(project, location)
+
+    # Last resort: auto-detect the generic LiteLLM backend.
+    if generic_litellm_key:
+        return _build_litellm_client(litellm_base_url, generic_litellm_key)
 
     raise click.ClickException(
         "Authentication required. Choose one:\n"
         "  1. API key: Set GEMINI_API_KEY env var or pass --api-key\n"
         "  2. Vertex AI: Pass --vertex flag (requires gcloud auth application-default login)\n"
-        "  3. LiteLLM: Set LITELLM_BASE_URL + LITELLM_API_KEY or pass --litellm\n"
+        "  3. LiteLLM: Set DECKSMITH_LITELLM_API_KEY, or set "
+        "LITELLM_BASE_URL + LITELLM_API_KEY\n"
         "\nGet an API key at: https://aistudio.google.com/app/apikey"
     )
 
@@ -3250,7 +3308,6 @@ def _handle_output(
 )
 @click.option(
     "--api-key",
-    envvar="GEMINI_API_KEY",
     help="Gemini API key (or set GEMINI_API_KEY env var)",
 )
 @click.option(
@@ -3273,8 +3330,8 @@ def _handle_output(
     "--litellm",
     "use_litellm",
     is_flag=True,
-    help="Use a LiteLLM / OpenAI-compatible endpoint (set LITELLM_BASE_URL and "
-    "LITELLM_API_KEY). Supports YouTube URLs and GCS URIs only.",
+    help="Use a LiteLLM / OpenAI-compatible endpoint. Uses the Decksmith team "
+    "key when configured; local files up to 20 MB are sent inline.",
 )
 @click.option(
     "--litellm-base-url",
@@ -3285,9 +3342,9 @@ def _handle_output(
 )
 @click.option(
     "--litellm-api-key",
-    envvar="LITELLM_API_KEY",
     default=None,
-    help="API key for the LiteLLM endpoint (or set LITELLM_API_KEY)",
+    help="API key for the LiteLLM endpoint (or set DECKSMITH_LITELLM_API_KEY "
+    "or LITELLM_API_KEY)",
 )
 @click.option(
     "--verbose",
@@ -3457,10 +3514,15 @@ def main(
             yt-process "URL" --vertex --project YOUR_PROJECT
 
         Option 3 - LiteLLM / OpenAI-compatible endpoint:
+            # Decksmith team budget (Anton URL is selected automatically)
+            export DECKSMITH_LITELLM_API_KEY="..."
+            yt-process ./recording.m4a
+
+            # Generic gateway
             export LITELLM_BASE_URL="https://your-gateway/v1"
             export LITELLM_API_KEY="sk-..."
             yt-process "URL" --litellm
-            (YouTube URLs and GCS URIs only; no Files API / local uploads)
+            (Local files up to 20 MB are sent inline; no Files API)
 
     \b
     Environment Variables:
@@ -3469,6 +3531,7 @@ def main(
         YT_PROCESS_PROJECT       GCP project for Vertex AI (required with --vertex)
         YT_PROCESS_LOCATION      GCP location for Vertex AI (default: global)
         GOOGLE_GENAI_USE_VERTEXAI  Set to "true" to auto-enable Vertex AI
+        DECKSMITH_LITELLM_API_KEY  Decksmith team key; auto-selects Anton LiteLLM
         LITELLM_BASE_URL         Base URL for a LiteLLM / OpenAI-compatible endpoint
         LITELLM_API_KEY          API key for the LiteLLM endpoint
         YT_PROCESS_GCS_BUCKET    GCS bucket for staging local files on Vertex
@@ -3483,13 +3546,6 @@ def main(
     if location is None:
         # Default to global for all models to avoid regional quota limits
         location = "global"
-
-    if model not in MODEL_PRICING:
-        click.echo(
-            f"Note: '{model}' has no entry in the pricing table, so cost will be "
-            f"reported as unknown. Known models: {', '.join(SUGGESTED_MODELS)}",
-            err=True,
-        )
 
     # Parse video processing options
     clip_start: str | None = None
@@ -3574,13 +3630,6 @@ def main(
             "already gets its own offset from the chapter start time."
         )
 
-    if thinking_level and not supports_thinking_level(model):
-        raise click.ClickException(
-            f"--thinking-level is not supported by {model}, which rejects it "
-            "with a 400. It is available on Gemini 3.x models "
-            f"(e.g. {DEFAULT_MODEL}, gemini-3.6-flash)."
-        )
-
     # Initialize client
     client = get_gemini_client(
         api_key=api_key,
@@ -3591,6 +3640,28 @@ def main(
         litellm_base_url=litellm_base_url,
         litellm_api_key=litellm_api_key,
     )
+
+    context = click.get_current_context(silent=True)
+    model_source = context.get_parameter_source("model") if context else None
+    model = _resolve_model_for_client(
+        model,
+        client,
+        model_was_default=model_source == ParameterSource.DEFAULT,
+    )
+
+    if model not in MODEL_PRICING:
+        click.echo(
+            f"Note: '{model}' has no entry in the pricing table, so cost will be "
+            f"reported as unknown. Known models: {', '.join(SUGGESTED_MODELS)}",
+            err=True,
+        )
+
+    if thinking_level and not supports_thinking_level(model):
+        raise click.ClickException(
+            f"--thinking-level is not supported by {model}, which rejects it "
+            "with a 400. It is available on Gemini 3.x models "
+            f"(e.g. {DEFAULT_MODEL}, gemini-3.6-flash)."
+        )
 
     # Handle upload-only mode
     if upload_only:

@@ -108,6 +108,25 @@ yt-process "./video.mp4"
 
 Route requests through any [LiteLLM](https://github.com/BerriAI/litellm) proxy (or other OpenAI-compatible gateway) that serves Gemini models. This lets you authenticate with a single gateway key instead of a Google API key or gcloud ADC.
 
+For presentation-recording workloads, `DECKSMITH_LITELLM_API_KEY` selects the
+Decksmith Anton team budget and defaults the endpoint to
+`https://litellm.anton-dev.pan.run/v1`. Because Anton does not expose the
+tool's normal `gemini-3.1-pro-preview` default, the tool uses
+`gemini-2.5-pro` when `--model` is omitted. An explicit `--model` is never
+rewritten.
+
+```bash
+# The key belongs in ~/.secrets/env.sh; do not commit its value.
+export DECKSMITH_LITELLM_API_KEY="..."
+yt-process ./recording.m4a
+```
+
+The Decksmith key is workload-specific and takes precedence over generic auth
+environment variables. Explicit `--api-key`, `--vertex`, and
+`--litellm-api-key` choices still win.
+
+For any other LiteLLM gateway, configure the generic variables:
+
 **Setup:**
 
 ```bash
@@ -136,7 +155,8 @@ yt-process "URL" --litellm --litellm-base-url https://your-gateway/v1 --litellm-
 | GCS URIs (`gs://`) | ✅ |
 | All analysis modes (incl. `segments`) | ✅ |
 | Custom prompts, model selection | ✅ |
-| Local file uploads / Files API (`--upload-only`, `--list-files`, `files/abc123`) | ❌ (no Files API on the endpoint) |
+| Local audio/video files up to 20 MB | ✅ (sent inline; no persistent upload) |
+| Files API (`--upload-only`, `--list-files`, `files/abc123`) | ❌ (no Files API on the endpoint) |
 | `--fps` / `--clip` / `--media-resolution` | ❌ (ignored with a warning) |
 | YouTube chapter `--split` | ❌ (relies on clipping) |
 
@@ -147,9 +167,11 @@ For the unsupported operations, use the Gemini API-key or Vertex AI backend.
 1. `--litellm` flag (LiteLLM / OpenAI-compatible endpoint)
 2. `--api-key` flag
 3. `--vertex` flag (Vertex AI with ADC)
-4. `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variables
-5. `GOOGLE_GENAI_USE_VERTEXAI=true` environment variable
-6. `LITELLM_API_KEY` set (auto-enables the LiteLLM backend when no other auth is given)
+4. `--litellm-api-key`
+5. `DECKSMITH_LITELLM_API_KEY` (auto-enables Anton LiteLLM)
+6. `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variables
+7. `GOOGLE_GENAI_USE_VERTEXAI=true` environment variable
+8. `LITELLM_API_KEY` set (generic last-resort auto-detection)
 
 ## Input Types
 
@@ -436,7 +458,8 @@ Options:
   --location TEXT                 GCP location for Vertex AI
   --litellm                      Use a LiteLLM / OpenAI-compatible endpoint
   --litellm-base-url TEXT         Base URL (or set LITELLM_BASE_URL)
-  --litellm-api-key TEXT          API key (or set LITELLM_API_KEY)
+  --litellm-api-key TEXT          API key (or set DECKSMITH_LITELLM_API_KEY or
+                                  LITELLM_API_KEY)
   --fps FLOAT                    Frame sampling rate (default: 1 FPS)
   --clip TEXT                    Process a clip: START-END (e.g., 1:30-5:00)
   --media-resolution [low|medium|high]

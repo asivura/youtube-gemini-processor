@@ -19,6 +19,8 @@ import pytest
 from click.testing import CliRunner
 
 from youtube_gemini_processor.cli import (
+    DECKSMITH_DEFAULT_MODEL,
+    DECKSMITH_LITELLM_BASE_URL,
     SEGMENTS_SCHEMA,
     LiteLLMClient,
     VideoAnalysis,
@@ -28,6 +30,7 @@ from youtube_gemini_processor.cli import (
     _inline_data_to_openai_part,
     _normalize_timestamp_to_hhmmss,
     _process_single_chapter,
+    _resolve_model_for_client,
     build_generate_config,
     build_media_part,
     fetch_youtube_chapters,
@@ -67,6 +70,7 @@ class TestGetGeminiClient:
             "GOOGLE_GENAI_USE_VERTEXAI": "",
             "LITELLM_API_KEY": "",
             "LITELLM_BASE_URL": "",
+            "DECKSMITH_LITELLM_API_KEY": "",
         },
         clear=False,
     )
@@ -118,6 +122,7 @@ class TestGetGeminiClient:
             "GOOGLE_API_KEY",
             "LITELLM_API_KEY",
             "LITELLM_BASE_URL",
+            "DECKSMITH_LITELLM_API_KEY",
         ):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
@@ -134,6 +139,7 @@ class TestGetGeminiClient:
             "GEMINI_API_KEY": "",
             "GOOGLE_API_KEY": "env-key",
             "GOOGLE_GENAI_USE_VERTEXAI": "",
+            "DECKSMITH_LITELLM_API_KEY": "",
         },
     )
     def test_google_api_key_env_fallback(self, mock_client_cls: MagicMock) -> None:
@@ -1580,7 +1586,11 @@ class TestLiteLLMBackendSelection:
 
     @patch.dict(
         "os.environ",
-        {"LITELLM_BASE_URL": "https://env-gw/v1", "LITELLM_API_KEY": "sk-env"},
+        {
+            "LITELLM_BASE_URL": "https://env-gw/v1",
+            "LITELLM_API_KEY": "sk-env",
+            "DECKSMITH_LITELLM_API_KEY": "",
+        },
     )
     def test_flag_selects_litellm(self) -> None:
         client = get_gemini_client(use_litellm=True)
@@ -1594,6 +1604,7 @@ class TestLiteLLMBackendSelection:
         {
             "LITELLM_BASE_URL": "https://env-gw/v1",
             "LITELLM_API_KEY": "sk-env",
+            "DECKSMITH_LITELLM_API_KEY": "",
             "GEMINI_API_KEY": "",
             "GOOGLE_API_KEY": "",
             "GOOGLE_GENAI_USE_VERTEXAI": "",
@@ -1609,6 +1620,7 @@ class TestLiteLLMBackendSelection:
         {
             "LITELLM_BASE_URL": "https://env-gw/v1",
             "LITELLM_API_KEY": "sk-env",
+            "DECKSMITH_LITELLM_API_KEY": "sk-decksmith",
             "GEMINI_API_KEY": "",
             "GOOGLE_API_KEY": "",
             "GOOGLE_GENAI_USE_VERTEXAI": "",
@@ -1628,6 +1640,7 @@ class TestLiteLLMBackendSelection:
         {
             "LITELLM_BASE_URL": "https://env-gw/v1",
             "LITELLM_API_KEY": "sk-env",
+            "DECKSMITH_LITELLM_API_KEY": "",
             "GEMINI_API_KEY": "",
             "GOOGLE_API_KEY": "google-env-key",
             "GOOGLE_GENAI_USE_VERTEXAI": "",
@@ -1641,15 +1654,111 @@ class TestLiteLLMBackendSelection:
         assert not isinstance(client, LiteLLMClient)
         mock_client_cls.assert_called_once_with(api_key="google-env-key")
 
-    @patch.dict("os.environ", {"LITELLM_API_KEY": "sk-env", "LITELLM_BASE_URL": ""})
+    @patch.dict(
+        "os.environ",
+        {
+            "LITELLM_API_KEY": "sk-env",
+            "LITELLM_BASE_URL": "",
+            "DECKSMITH_LITELLM_API_KEY": "",
+        },
+    )
     def test_flag_without_base_url_raises(self) -> None:
         with pytest.raises(click.ClickException, match="base URL"):
             get_gemini_client(use_litellm=True)
 
-    @patch.dict("os.environ", {"LITELLM_API_KEY": "", "LITELLM_BASE_URL": ""})
+    @patch.dict(
+        "os.environ",
+        {
+            "LITELLM_API_KEY": "",
+            "LITELLM_BASE_URL": "",
+            "DECKSMITH_LITELLM_API_KEY": "",
+        },
+    )
     def test_flag_without_key_raises(self) -> None:
         with pytest.raises(click.ClickException, match="API key"):
             get_gemini_client(use_litellm=True, litellm_base_url="https://gw/v1")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "DECKSMITH_LITELLM_API_KEY": "sk-decksmith",
+            "LITELLM_API_KEY": "sk-generic",
+            "LITELLM_BASE_URL": "",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "GOOGLE_GENAI_USE_VERTEXAI": "true",
+        },
+    )
+    def test_decksmith_key_beats_generic_auth_and_defaults_anton_url(self) -> None:
+        client = get_gemini_client()
+        assert isinstance(client, LiteLLMClient)
+        assert client.base_url == DECKSMITH_LITELLM_BASE_URL
+        assert client.api_key == "sk-decksmith"
+        assert client.credential_source == "decksmith"
+
+    @patch.dict(
+        "os.environ",
+        {
+            "DECKSMITH_LITELLM_API_KEY": "sk-decksmith",
+            "LITELLM_API_KEY": "sk-generic",
+            "LITELLM_BASE_URL": "",
+        },
+    )
+    def test_explicit_litellm_credentials_beat_decksmith(self) -> None:
+        client = get_gemini_client(
+            use_litellm=True,
+            litellm_base_url="https://explicit-gw/v1",
+            litellm_api_key="sk-explicit",
+        )
+        assert isinstance(client, LiteLLMClient)
+        assert client.base_url == "https://explicit-gw/v1"
+        assert client.api_key == "sk-explicit"
+        assert client.credential_source == "explicit"
+
+    @patch("google.genai.Client")
+    @patch.dict(
+        "os.environ",
+        {
+            "DECKSMITH_LITELLM_API_KEY": "sk-decksmith",
+            "GOOGLE_GENAI_USE_VERTEXAI": "",
+        },
+    )
+    def test_explicit_vertex_beats_decksmith(self, mock_client_cls: MagicMock) -> None:
+        client = get_gemini_client(
+            use_vertex=True, project="project", location="us-central1"
+        )
+        assert not isinstance(client, LiteLLMClient)
+        mock_client_cls.assert_called_once_with(
+            vertexai=True, project="project", location="us-central1"
+        )
+
+
+class TestDecksmithModelSelection:
+    def test_default_uses_anton_supported_model(self) -> None:
+        client = LiteLLMClient(
+            DECKSMITH_LITELLM_BASE_URL,
+            "sk-decksmith",
+            credential_source="decksmith",
+        )
+        assert (
+            _resolve_model_for_client(
+                "gemini-3.1-pro-preview", client, model_was_default=True
+            )
+            == DECKSMITH_DEFAULT_MODEL
+        )
+
+    def test_explicit_model_is_preserved(self) -> None:
+        client = LiteLLMClient(
+            DECKSMITH_LITELLM_BASE_URL,
+            "sk-decksmith",
+            credential_source="decksmith",
+        )
+        assert (
+            _resolve_model_for_client(
+                "gemini-3-pro-preview", client, model_was_default=False
+            )
+            == "gemini-3-pro-preview"
+        )
 
 
 class TestLiteLLMRequestTranslation:

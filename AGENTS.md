@@ -218,18 +218,24 @@ endpoint. The LiteLLM backend (`LiteLLMClient` in `cli.py`) targets any
 OpenAI-compatible gateway proxying Gemini models via `/chat/completions`. It
 duck-types `genai.Client` (`.models.generate_content`) so the `process_*` and
 `_call_gemini_and_parse` paths are unchanged. YouTube URLs (and GCS `gs://` URIs)
-are sent as an OpenAI `file` content block; `response_schema` maps to
-`response_format.json_schema`. Does NOT support the Gemini Files API (local
-uploads, `files/*` refs) or `VideoMetadata` (`--fps`/`--clip`/`--media-resolution`,
-chapter `--split`) — these are guarded or warn-and-ignored in `main()`.
+are sent as an OpenAI `file` content block; local files up to 20 MB are sent
+inline; `response_schema` maps to `response_format.json_schema`. It does NOT
+support Gemini Files API operations or `files/*` refs. `VideoMetadata`
+(`--fps`/`--clip`/`--media-resolution`, chapter `--split`) has no
+OpenAI-compatible equivalent and is guarded or warn-and-ignored in `main()`.
 
 Priority order:
-1. `--litellm` flag (or `LITELLM_BASE_URL` + `LITELLM_API_KEY`)
+1. `--litellm` flag
 2. `--api-key` flag
 3. `--vertex` flag (Vertex AI with ADC)
-4. `GEMINI_API_KEY` or `GOOGLE_API_KEY` env vars
-5. `GOOGLE_GENAI_USE_VERTEXAI=true` env var
-6. `LITELLM_API_KEY` set with no other auth (auto-enables LiteLLM)
+4. `--litellm-api-key`
+5. `DECKSMITH_LITELLM_API_KEY` (Anton URL and `gemini-2.5-pro` default)
+6. `GEMINI_API_KEY` or `GOOGLE_API_KEY` env vars
+7. `GOOGLE_GENAI_USE_VERTEXAI=true` env var
+8. `LITELLM_API_KEY` set with no other auth (auto-enables generic LiteLLM)
+
+The Decksmith default model applies only when Click reports that `--model` came
+from its default. Never rewrite an explicitly supplied model.
 
 ## Models and Pricing
 

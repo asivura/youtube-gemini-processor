@@ -227,9 +227,20 @@ class TestVertexDetection:
         client.vertexai = False
         assert is_vertex_client(client) is False
 
-    def test_truthy_non_bool_is_not_vertex(self) -> None:
-        """A stub attribute must not silently route down the Vertex path."""
-        assert is_vertex_client(MagicMock()) is False
+    def test_non_bool_truthy_value_is_not_vertex(self) -> None:
+        """Fail closed on anything that is not literally True.
+
+        Uses a plain object rather than a MagicMock: asserting that a mock
+        reads as non-Vertex encodes test convenience as a requirement. The
+        real intent is that a truthy-but-not-True attribute (a stub, a 1, a
+        string) must not route media down the Vertex transport.
+        """
+        from types import SimpleNamespace
+
+        assert is_vertex_client(SimpleNamespace(vertexai=1)) is False
+        assert is_vertex_client(SimpleNamespace(vertexai="yes")) is False
+        assert is_vertex_client(SimpleNamespace()) is False
+        assert is_vertex_client(SimpleNamespace(vertexai=True)) is True
 
     def test_require_developer_api_raises_on_vertex(self) -> None:
         client = MagicMock()
@@ -450,9 +461,41 @@ class TestModelCapabilityGuards:
     """Both of these hard-400 the request; catch them before spending a call."""
 
     def test_max_output_tokens_is_below_the_exclusive_ceiling(self) -> None:
-        """gemini-2.5-flash-lite rejects 65536: the range excludes its top."""
-        assert cli_module.DEFAULT_MAX_OUTPUT_TOKENS == 65535
-        assert cli_module.get_max_output_tokens("gemini-2.5-flash-lite") < 65536
+        """gemini-2.5-flash-lite rejects 65536: the range excludes its top.
+
+        Asserts the constant against the API's documented bound rather than
+        against itself, so raising it back to a rejected value fails here.
+        """
+        for model in SUGGESTED_MODELS:
+            cap = cli_module.get_max_output_tokens(model)
+            assert 1 <= cap < 65536, f"{model} would be rejected with {cap}"
+
+    def test_inline_limit_is_the_value_the_dispatch_actually_uses(
+        self, tmp_path: Path
+    ) -> None:
+        """Pin the threshold to observed behavior, not to itself.
+
+        Every other transport test anchors on INLINE_MAX_BYTES +/- 1, so the
+        constant was unfalsifiable — raising it to 20 GB changed nothing.
+        20 MB is a deliberately conservative choice (Vertex was measured
+        accepting 30 MB raw), and it also bounds peak memory per worker.
+        """
+        assert INLINE_MAX_BYTES == 20 * 1024 * 1024
+
+        media = tmp_path / "big.mp4"
+        media.write_bytes(b"")
+        with pytest.raises(click.ClickException, match="inline limit"):
+            _build_vertex_local_part(
+                media,
+                "video/mp4",
+                "video",
+                file_size=21 * 1024 * 1024,
+                gcs_bucket=None,
+                verbose=False,
+                fps=None,
+                clip_start=None,
+                clip_end=None,
+            )
 
     @pytest.mark.parametrize(
         ("model", "supported"),
@@ -654,15 +697,66 @@ class TestAudioClipping:
 
 
 class TestLiteLLMTruncation:
-    """An OpenAI gateway reports a clipped answer as finish_reason=length."""
+    """An OpenAI gateway reports a clipped answer as finish_reason=length.
+
+    These drive the real adapter with gateway-shaped JSON. An earlier version
+    of this class passed "MAX_TOKENS" straight into the response constructor
+    and asserted it was stored, which proved nothing: deleting the actual
+    mapping left it green.
+    """
+
+    @staticmethod
+    def _gateway_response(finish_reason: str):
+        payload = {
+            "choices": [
+                {"message": {"content": "body"}, "finish_reason": finish_reason}
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = payload
+        return resp
+
+    def _call(self, finish_reason: str):
+        from google.genai import types
+
+        client = cli_module.LiteLLMClient(base_url="http://gw/v1", api_key="k")
+        with patch.object(
+            client.http, "post", return_value=self._gateway_response(finish_reason)
+        ):
+            return client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=[types.Content(role="user", parts=[types.Part(text="hello")])],
+                config=None,
+            )
 
     def test_length_maps_to_max_tokens(self) -> None:
-        resp = cli_module._LiteLLMResponse("body", None, finish_reason="MAX_TOKENS")
-        assert resp.candidates[0].finish_reason == "MAX_TOKENS"
+        response = self._call("length")
+        assert response.candidates[0].finish_reason == "MAX_TOKENS"
 
-    def test_absent_finish_reason_yields_no_candidates(self) -> None:
-        resp = cli_module._LiteLLMResponse("body", None)
-        assert resp.candidates == []
+    def test_stop_does_not_look_truncated(self) -> None:
+        response = self._call("stop")
+        assert response.candidates[0].finish_reason == "STOP"
+
+    def test_truncated_gateway_run_sets_truncated_on_the_analysis(self) -> None:
+        """End to end: a clipped gateway answer must not report as clean."""
+        from google.genai import types
+
+        analysis = VideoAnalysis(url="u")
+        client = MagicMock()
+        client.vertexai = False
+        client.models.generate_content.return_value = self._call("length")
+        cli_module._call_gemini_and_parse(
+            client,
+            types.Part(
+                file_data=types.FileData(file_uri="gs://b/x.mp4", mime_type="video/mp4")
+            ),
+            "gemini-3.6-flash",
+            "p",
+            analysis,
+        )
+        assert analysis.truncated is True
 
 
 class TestRetry:
@@ -785,6 +879,266 @@ class TestAudioHandling:
     def test_error_header_matches_kind(self) -> None:
         analysis = VideoAnalysis(url="u", error="boom")
         assert "# Error Processing Audio" in format_output_markdown(analysis, "audio")
+
+
+class TestTruncationDetection:
+    """Detection, not rendering.
+
+    TestTruncation below constructs `truncated=True` by hand and checks the
+    formatting. Nothing there proves the flag is ever *set*, so four separate
+    mutations to the detection logic survived the suite.
+    """
+
+    @staticmethod
+    def _response(finish_reason: str, text: str = "partial body"):
+        response = MagicMock()
+        response.text = text
+        response.usage_metadata = _usage_meta(prompt=10, candidates=5)
+        candidate = MagicMock()
+        candidate.finish_reason.name = finish_reason
+        response.candidates = [candidate]
+        return response
+
+    def _run(self, finish_reason: str) -> VideoAnalysis:
+        from google.genai import types
+
+        client = MagicMock()
+        client.vertexai = False
+        client.models.generate_content.return_value = self._response(finish_reason)
+        analysis = VideoAnalysis(url="u")
+        cli_module._call_gemini_and_parse(
+            client,
+            types.Part(
+                file_data=types.FileData(file_uri="gs://b/x.mp4", mime_type="video/mp4")
+            ),
+            "gemini-3.6-flash",
+            "p",
+            analysis,
+        )
+        return analysis
+
+    def test_max_tokens_sets_truncated(self) -> None:
+        assert self._run("MAX_TOKENS").truncated is True
+
+    def test_stop_does_not_set_truncated(self) -> None:
+        assert self._run("STOP").truncated is False
+
+    def test_finish_reason_is_recorded(self) -> None:
+        assert self._run("MAX_TOKENS").finish_reason == "MAX_TOKENS"
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_truncated_run_exits_two(self, mock_client: MagicMock) -> None:
+        """Exit 2 means 'succeeded but incomplete' and was never exercised."""
+        client = MagicMock()
+        client.vertexai = False
+        client.models.generate_content.return_value = self._response("MAX_TOKENS")
+        mock_client.return_value = client
+
+        result = CliRunner().invoke(
+            main, ["https://youtube.com/watch?v=trunc1", "--api-key", "k"]
+        )
+        assert result.exit_code == 2
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_clean_run_exits_zero(self, mock_client: MagicMock) -> None:
+        client = MagicMock()
+        client.vertexai = False
+        client.models.generate_content.return_value = self._response("STOP")
+        mock_client.return_value = client
+
+        result = CliRunner().invoke(
+            main, ["https://youtube.com/watch?v=clean1", "--api-key", "k"]
+        )
+        assert result.exit_code == 0
+
+
+class TestLocalFileDispatch:
+    """process_local_file's backend routing — the wiring, not the builders."""
+
+    @staticmethod
+    def _client(*, vertex: bool):
+        client = MagicMock()
+        client.vertexai = vertex
+        response = MagicMock()
+        response.text = "body"
+        response.usage_metadata = _usage_meta(prompt=10, candidates=5)
+        response.candidates = []
+        client.models.generate_content.return_value = response
+        return client
+
+    def test_vertex_sends_inline_and_never_touches_the_files_api(
+        self, tmp_path: Path
+    ) -> None:
+        """Removing the Vertex branch was invisible to the suite."""
+        media = tmp_path / "memo.m4a"
+        media.write_bytes(b"\x00" * 512)
+        client = self._client(vertex=True)
+
+        analysis = cli_module.process_local_file(client, str(media), "prompt")
+
+        assert analysis.error is None, analysis.error
+        client.files.upload.assert_not_called()
+        sent = client.models.generate_content.call_args.kwargs["contents"][0]
+        assert sent.parts[0].inline_data is not None
+        assert sent.parts[0].file_data is None
+
+    def test_developer_api_still_uses_the_files_api(self, tmp_path: Path) -> None:
+        media = tmp_path / "memo.m4a"
+        media.write_bytes(b"\x00" * 512)
+        client = self._client(vertex=False)
+        uploaded = MagicMock()
+        uploaded.state.name = "ACTIVE"
+        uploaded.uri = "https://generativelanguage.googleapis.com/v1beta/files/x"
+        uploaded.name = "files/x"
+        client.files.upload.return_value = uploaded
+
+        analysis = cli_module.process_local_file(client, str(media), "prompt")
+
+        assert analysis.error is None, analysis.error
+        client.files.upload.assert_called_once()
+
+    def test_audio_clip_trims_and_clears_the_offsets(self, tmp_path: Path) -> None:
+        """Deleting the trim dispatch entirely was invisible to the suite."""
+        media = tmp_path / "call.m4a"
+        media.write_bytes(b"\x00" * 512)
+        trimmed = tmp_path / "trimmed.m4a"
+        trimmed.write_bytes(b"\x01" * 128)
+        client = self._client(vertex=True)
+
+        with patch(
+            "youtube_gemini_processor.cli.trim_audio_clip", return_value=trimmed
+        ) as mock_trim:
+            cli_module.process_local_file(
+                client, str(media), "prompt", clip_start="8s", clip_end="16s"
+            )
+
+        mock_trim.assert_called_once()
+        # The offsets must NOT also ride along as VideoMetadata: the API
+        # ignores them on audio, and the file is already trimmed.
+        sent = client.models.generate_content.call_args.kwargs["contents"][0]
+        assert sent.parts[0].video_metadata is None
+
+    def test_video_clip_does_not_trim(self, tmp_path: Path) -> None:
+        """Video clipping genuinely works API-side; it must not be trimmed."""
+        media = tmp_path / "talk.mp4"
+        media.write_bytes(b"\x00" * 512)
+        client = self._client(vertex=True)
+
+        with patch("youtube_gemini_processor.cli.trim_audio_clip") as mock_trim:
+            cli_module.process_local_file(
+                client, str(media), "prompt", clip_start="8s", clip_end="16s"
+            )
+
+        mock_trim.assert_not_called()
+        sent = client.models.generate_content.call_args.kwargs["contents"][0]
+        assert sent.parts[0].video_metadata.start_offset == "8s"
+
+
+class TestAudioPromptWiring:
+    """select_prompt is tested; the CLI call sites that use it were not."""
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_audio_input_sends_an_audio_prompt(
+        self, mock_client: MagicMock, tmp_path: Path
+    ) -> None:
+        media = tmp_path / "memo.m4a"
+        media.write_bytes(b"\x00" * 512)
+        client = MagicMock()
+        client.vertexai = True
+        response = MagicMock()
+        response.text = "body"
+        response.usage_metadata = _usage_meta(prompt=10, candidates=5)
+        response.candidates = []
+        client.models.generate_content.return_value = response
+        mock_client.return_value = client
+
+        result = CliRunner().invoke(
+            main, [str(media), "--vertex", "--project", "p", "-m", "transcript"]
+        )
+        assert result.exit_code == 0
+
+        prompt = (
+            client.models.generate_content.call_args.kwargs["contents"][0].parts[1].text
+        )
+        assert "AUDIO" in prompt.upper()
+        assert "**Visual Content**" not in prompt
+        assert "Text on screen" not in prompt
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_batch_picks_the_prompt_per_input(
+        self, mock_client: MagicMock, tmp_path: Path
+    ) -> None:
+        """Batch is the only path that exercises the per-input selection.
+
+        For a single input, main() resolves the audio prompt up front, which
+        masks the selection inside analyze(). In batch mode `input` is None,
+        so a mixed audio/video batch depends entirely on the inner call site
+        — deleting it is otherwise invisible.
+        """
+        audio = tmp_path / "memo.m4a"
+        audio.write_bytes(b"\x00" * 512)
+        video = tmp_path / "talk.mp4"
+        video.write_bytes(b"\x00" * 512)
+        batch = tmp_path / "inputs.txt"
+        batch.write_text(f"{audio}\n{video}\n")
+
+        client = MagicMock()
+        client.vertexai = True
+        response = MagicMock()
+        response.text = "body"
+        response.usage_metadata = _usage_meta(prompt=10, candidates=5)
+        response.candidates = []
+        client.models.generate_content.return_value = response
+        mock_client.return_value = client
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "--batch",
+                str(batch),
+                "-o",
+                str(tmp_path / "out"),
+                "--vertex",
+                "--project",
+                "p",
+                "-m",
+                "transcript",
+                "--workers",
+                "1",
+            ],
+        )
+        assert result.exit_code == 0
+
+        by_kind = {}
+        for call in client.models.generate_content.call_args_list:
+            parts = call.kwargs["contents"][0].parts
+            mime = parts[0].inline_data.mime_type
+            by_kind[mime.split("/")[0]] = parts[1].text
+
+        assert "**Visual Content**" not in by_kind["audio"]
+        assert "AUDIO" in by_kind["audio"].upper()
+        assert "isual" in by_kind["video"]
+
+    @patch("youtube_gemini_processor.cli.get_gemini_client")
+    def test_video_input_still_asks_for_visuals(self, mock_client: MagicMock) -> None:
+        client = MagicMock()
+        client.vertexai = False
+        response = MagicMock()
+        response.text = "body"
+        response.usage_metadata = _usage_meta(prompt=10, candidates=5)
+        response.candidates = []
+        client.models.generate_content.return_value = response
+        mock_client.return_value = client
+
+        result = CliRunner().invoke(
+            main,
+            ["https://youtube.com/watch?v=vid1", "--api-key", "k", "-m", "concise"],
+        )
+        assert result.exit_code == 0
+        prompt = (
+            client.models.generate_content.call_args.kwargs["contents"][0].parts[1].text
+        )
+        assert "isual" in prompt
 
 
 class TestTruncation:
